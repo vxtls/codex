@@ -16,6 +16,7 @@ use crate::state::validate_policy_against_constraints;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use codex_client::resolve_host_with_doh;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use globset::GlobSet;
 use serde::Serialize;
@@ -27,7 +28,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::net::lookup_host;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
@@ -701,7 +701,7 @@ async fn host_resolves_to_non_public_ip(host: &str, port: u16) -> bool {
     // If DNS lookup fails, default to "not local/private" rather than blocking. In practice, the
     // subsequent connect attempt will fail anyway, and blocking on transient resolver issues would
     // make the proxy fragile. The allowlist/denylist remains the primary control plane.
-    let addrs = match timeout(DNS_LOOKUP_TIMEOUT, lookup_host((host, port))).await {
+    let addrs = match timeout(DNS_LOOKUP_TIMEOUT, resolve_host_with_doh(host, port)).await {
         Ok(Ok(addrs)) => addrs,
         Ok(Err(_)) | Err(_) => return false,
     };

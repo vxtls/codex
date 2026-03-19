@@ -9,6 +9,7 @@ use crate::config::types::McpServerDisabledReason;
 use crate::config::types::McpServerTransportConfig;
 use crate::config::types::MemoriesConfig;
 use crate::config::types::MemoriesToml;
+use crate::config::types::NetworkingToml;
 use crate::config::types::ModelAvailabilityNuxConfig;
 use crate::config::types::Notice;
 use crate::config::types::NotificationMethod;
@@ -85,6 +86,7 @@ use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_rmcp_client::OAuthCredentialsStoreMode;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_client::NetworkRuntimeConfig;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde::Deserializer;
@@ -1402,6 +1404,10 @@ pub struct ConfigToml {
     /// Base URL override for the built-in `openai` model provider.
     pub openai_base_url: Option<String>,
 
+    /// Outbound networking policy for Codex-owned requests.
+    #[serde(default)]
+    pub networking: Option<NetworkingToml>,
+
     /// Experimental / do not use. Overrides the URL used when connecting to
     /// a remote exec server.
     pub experimental_exec_server_url: Option<String>,
@@ -2067,6 +2073,53 @@ fn resolve_web_search_config(
     }
 }
 
+fn resolve_networking_runtime_config(
+    networking: Option<&NetworkingToml>,
+) -> std::io::Result<NetworkRuntimeConfig> {
+    #[cfg(test)]
+    if networking.is_none() {
+        return Ok(NetworkRuntimeConfig {
+            doh_servers: vec!["https://1.1.1.1/dns-query".to_string()],
+            request_log_path: None,
+        });
+    }
+
+    let Some(networking) = networking else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing required `[networking]` config section",
+        ));
+    };
+
+    let Some(doh_servers) = networking.doh_servers.as_ref() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "missing required `networking.doh_servers` setting",
+        ));
+    };
+
+    let doh_servers = doh_servers
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if doh_servers.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`networking.doh_servers` must contain at least one URL",
+        ));
+    }
+
+    Ok(NetworkRuntimeConfig {
+        doh_servers,
+        request_log_path: networking
+            .request_log_path
+            .as_ref()
+            .map(AbsolutePathBuf::to_path_buf),
+    })
+}
+
 pub(crate) fn resolve_web_search_mode_for_turn(
     web_search_mode: &Constrained<WebSearchMode>,
     sandbox_policy: &SandboxPolicy,
@@ -2581,6 +2634,14 @@ impl Config {
                 .clone()
                 .or(cfg.model_catalog_json.clone()),
         )?;
+        let networking_runtime_config =
+            resolve_networking_runtime_config(cfg.networking.as_ref())?;
+        codex_client::configure_networking(networking_runtime_config).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid networking config: {error}"),
+            )
+        })?;
 
         let log_dir = cfg
             .log_dir

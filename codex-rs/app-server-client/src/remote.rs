@@ -21,6 +21,8 @@ use crate::RequestResult;
 use crate::SHUTDOWN_TIMEOUT;
 use crate::TypedRequestError;
 use crate::request_method_name;
+use codex_client::log_request_metadata;
+use codex_client::resolve_host_with_doh;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -45,8 +47,9 @@ use tokio::sync::oneshot;
 use tokio::time::timeout;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::warn;
 use url::Url;
 
@@ -125,22 +128,114 @@ impl RemoteAppServerClient {
     pub async fn connect(args: RemoteAppServerConnectArgs) -> IoResult<Self> {
         let channel_capacity = args.channel_capacity.max(1);
         let websocket_url = args.websocket_url.clone();
+        let connect_start = std::time::Instant::now();
         let url = Url::parse(&websocket_url).map_err(|err| {
             IoError::new(
                 ErrorKind::InvalidInput,
                 format!("invalid websocket URL `{websocket_url}`: {err}"),
             )
         })?;
-        let stream = timeout(CONNECT_TIMEOUT, connect_async(url.as_str()))
-            .await
+        let host = url.host_str().ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("websocket URL `{websocket_url}` is missing host"),
+            )
+        })?;
+        let port = url.port_or_known_default().ok_or_else(|| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("websocket URL `{websocket_url}` is missing port"),
+            )
+        })?;
+        let addrs = resolve_host_with_doh(host, port).await.map_err(|err| {
+            let message = format!("DoH resolution failed for `{websocket_url}`: {err}");
+            log_request_metadata(
+                "ws",
+                "GET",
+                websocket_url.as_str(),
+                None,
+                connect_start.elapsed(),
+                Some(message.as_str()),
+            );
+            IoError::new(ErrorKind::InvalidInput, message)
+        })?;
+        let mut tcp_stream = None;
+        let mut last_connect_error = None;
+        for addr in addrs {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    tcp_stream = Some(stream);
+                    break;
+                }
+                Err(err) => {
+                    last_connect_error = Some(err);
+                }
+            }
+        }
+        let Some(tcp_stream) = tcp_stream else {
+            let message = last_connect_error.map_or_else(
+                || format!("failed to connect to remote app server at `{websocket_url}`"),
+                |error| {
+                    format!("failed to connect to remote app server at `{websocket_url}`: {error}")
+                },
+            );
+            log_request_metadata(
+                "ws",
+                "GET",
+                websocket_url.as_str(),
+                None,
+                connect_start.elapsed(),
+                Some(message.as_str()),
+            );
+            return Err(IoError::other(message));
+        };
+        let request = websocket_url.as_str().into_client_request().map_err(|err| {
+            IoError::new(
+                ErrorKind::InvalidInput,
+                format!("invalid websocket request `{websocket_url}`: {err}"),
+            )
+        })?;
+        let stream = timeout(
+            CONNECT_TIMEOUT,
+            client_async_tls_with_config(request, tcp_stream, None, None),
+        )
+        .await
             .map_err(|_| {
-                IoError::new(
-                    ErrorKind::TimedOut,
-                    format!("timed out connecting to remote app server at `{websocket_url}`"),
-                )
+                let message =
+                    format!("timed out connecting to remote app server at `{websocket_url}`");
+                log_request_metadata(
+                    "ws",
+                    "GET",
+                    websocket_url.as_str(),
+                    None,
+                    connect_start.elapsed(),
+                    Some(message.as_str()),
+                );
+                IoError::new(ErrorKind::TimedOut, message)
             })?
-            .map(|(stream, _response)| stream)
+            .map(|(stream, response)| {
+                log_request_metadata(
+                    "ws",
+                    "GET",
+                    websocket_url.as_str(),
+                    Some(response.status().as_u16()),
+                    connect_start.elapsed(),
+                    None,
+                );
+                stream
+            })
             .map_err(|err| {
+                let message = format!(
+                    "failed to connect to remote app server at `{websocket_url}`: {err}"
+                );
+                log_request_metadata(
+                    "ws",
+                    "GET",
+                    websocket_url.as_str(),
+                    None,
+                    connect_start.elapsed(),
+                    Some(message.as_str()),
+                );
                 IoError::other(format!(
                     "failed to connect to remote app server at `{websocket_url}`: {err}"
                 ))
