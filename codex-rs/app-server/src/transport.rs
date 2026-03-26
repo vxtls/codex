@@ -1,9 +1,15 @@
+pub(crate) mod auth;
+
+use self::auth::WebsocketAuthPolicy;
+use self::auth::authorize_upgrade;
+use self::auth::should_warn_about_unauthenticated_non_loopback_listener;
 use crate::error_code::OVERLOADED_ERROR_CODE;
 use crate::message_processor::ConnectionSessionState;
 use crate::outgoing_message::ConnectionId;
 use crate::outgoing_message::OutgoingEnvelope;
 use crate::outgoing_message::OutgoingError;
 use crate::outgoing_message::OutgoingMessage;
+use crate::outgoing_message::QueuedOutgoingMessage;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::ConnectInfo;
@@ -11,6 +17,7 @@ use axum::extract::State;
 use axum::extract::ws::Message as WebSocketMessage;
 use axum::extract::ws::WebSocket;
 use axum::extract::ws::WebSocketUpgrade;
+use axum::http::HeaderMap;
 use axum::http::Request;
 use axum::http::StatusCode;
 use axum::http::header::ORIGIN;
@@ -82,7 +89,7 @@ fn print_websocket_startup_banner(addr: SocketAddr) {
         );
     } else {
         eprintln!(
-            "  {note_label} this is a raw WS server; consider running behind TLS/auth for real remote use"
+            "  {note_label} websocket auth is opt-in in this build; configure `--ws-auth ...` before real remote use"
         );
     }
 }
@@ -91,6 +98,7 @@ fn print_websocket_startup_banner(addr: SocketAddr) {
 struct WebSocketListenerState {
     transport_event_tx: mpsc::Sender<TransportEvent>,
     connection_counter: Arc<AtomicU64>,
+    auth_policy: Arc<WebsocketAuthPolicy>,
 }
 
 async fn health_check_handler() -> StatusCode {
@@ -117,12 +125,23 @@ async fn websocket_upgrade_handler(
     websocket: WebSocketUpgrade,
     ConnectInfo(peer_addr): ConnectInfo<SocketAddr>,
     State(state): State<WebSocketListenerState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(err) = authorize_upgrade(&headers, state.auth_policy.as_ref()) {
+        warn!(
+            %peer_addr,
+            message = err.message(),
+            "rejecting websocket client during upgrade"
+        );
+        return (err.status_code(), err.message()).into_response();
+    }
     let connection_id = ConnectionId(state.connection_counter.fetch_add(1, Ordering::Relaxed));
     info!(%peer_addr, "websocket client connected");
-    websocket.on_upgrade(move |stream| async move {
-        run_websocket_connection(connection_id, stream, state.transport_event_tx).await;
-    })
+    websocket
+        .on_upgrade(move |stream| async move {
+            run_websocket_connection(connection_id, stream, state.transport_event_tx).await;
+        })
+        .into_response()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -187,8 +206,7 @@ impl FromStr for AppServerTransport {
 pub(crate) enum TransportEvent {
     ConnectionOpened {
         connection_id: ConnectionId,
-        writer: mpsc::Sender<OutgoingMessage>,
-        allow_legacy_notifications: bool,
+        writer: mpsc::Sender<QueuedOutgoingMessage>,
         disconnect_sender: Option<CancellationToken>,
     },
     ConnectionClosed {
@@ -226,25 +244,22 @@ pub(crate) struct OutboundConnectionState {
     pub(crate) initialized: Arc<AtomicBool>,
     pub(crate) experimental_api_enabled: Arc<AtomicBool>,
     pub(crate) opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
-    pub(crate) allow_legacy_notifications: bool,
-    pub(crate) writer: mpsc::Sender<OutgoingMessage>,
+    pub(crate) writer: mpsc::Sender<QueuedOutgoingMessage>,
     disconnect_sender: Option<CancellationToken>,
 }
 
 impl OutboundConnectionState {
     pub(crate) fn new(
-        writer: mpsc::Sender<OutgoingMessage>,
+        writer: mpsc::Sender<QueuedOutgoingMessage>,
         initialized: Arc<AtomicBool>,
         experimental_api_enabled: Arc<AtomicBool>,
         opted_out_notification_methods: Arc<RwLock<HashSet<String>>>,
-        allow_legacy_notifications: bool,
         disconnect_sender: Option<CancellationToken>,
     ) -> Self {
         Self {
             initialized,
             experimental_api_enabled,
             opted_out_notification_methods,
-            allow_legacy_notifications,
             writer,
             disconnect_sender,
         }
@@ -266,13 +281,12 @@ pub(crate) async fn start_stdio_connection(
     stdio_handles: &mut Vec<JoinHandle<()>>,
 ) -> IoResult<()> {
     let connection_id = ConnectionId(0);
-    let (writer_tx, mut writer_rx) = mpsc::channel::<OutgoingMessage>(CHANNEL_CAPACITY);
+    let (writer_tx, mut writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
     transport_event_tx
         .send(TransportEvent::ConnectionOpened {
             connection_id,
             writer: writer_tx,
-            allow_legacy_notifications: false,
             disconnect_sender: None,
         })
         .await
@@ -314,14 +328,17 @@ pub(crate) async fn start_stdio_connection(
 
     stdio_handles.push(tokio::spawn(async move {
         let mut stdout = io::stdout();
-        while let Some(outgoing_message) = writer_rx.recv().await {
-            let Some(mut json) = serialize_outgoing_message(outgoing_message) else {
+        while let Some(queued_message) = writer_rx.recv().await {
+            let Some(mut json) = serialize_outgoing_message(queued_message.message) else {
                 continue;
             };
             json.push('\n');
             if let Err(err) = stdout.write_all(json.as_bytes()).await {
                 error!("Failed to write to stdout: {err}");
                 break;
+            }
+            if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                let _ = write_complete_tx.send(());
             }
         }
         info!("stdout writer exited (channel closed)");
@@ -334,7 +351,14 @@ pub(crate) async fn start_websocket_acceptor(
     bind_address: SocketAddr,
     transport_event_tx: mpsc::Sender<TransportEvent>,
     shutdown_token: CancellationToken,
+    auth_policy: WebsocketAuthPolicy,
 ) -> IoResult<JoinHandle<()>> {
+    if should_warn_about_unauthenticated_non_loopback_listener(bind_address, &auth_policy) {
+        warn!(
+            %bind_address,
+            "starting non-loopback websocket listener without auth; websocket auth is opt-in for now and will become the default in a future release"
+        );
+    }
     let listener = TcpListener::bind(bind_address).await?;
     let local_addr = listener.local_addr()?;
     print_websocket_startup_banner(local_addr);
@@ -348,6 +372,7 @@ pub(crate) async fn start_websocket_acceptor(
         .with_state(WebSocketListenerState {
             transport_event_tx,
             connection_counter: Arc::new(AtomicU64::new(1)),
+            auth_policy: Arc::new(auth_policy),
         });
     let server = axum::serve(
         listener,
@@ -369,14 +394,13 @@ async fn run_websocket_connection(
     websocket_stream: WebSocket,
     transport_event_tx: mpsc::Sender<TransportEvent>,
 ) {
-    let (writer_tx, writer_rx) = mpsc::channel::<OutgoingMessage>(CHANNEL_CAPACITY);
+    let (writer_tx, writer_rx) = mpsc::channel::<QueuedOutgoingMessage>(CHANNEL_CAPACITY);
     let writer_tx_for_reader = writer_tx.clone();
     let disconnect_token = CancellationToken::new();
     if transport_event_tx
         .send(TransportEvent::ConnectionOpened {
             connection_id,
             writer: writer_tx,
-            allow_legacy_notifications: false,
             disconnect_sender: Some(disconnect_token.clone()),
         })
         .await
@@ -421,7 +445,7 @@ async fn run_websocket_connection(
 
 async fn run_websocket_outbound_loop(
     mut websocket_writer: futures::stream::SplitSink<WebSocket, WebSocketMessage>,
-    mut writer_rx: mpsc::Receiver<OutgoingMessage>,
+    mut writer_rx: mpsc::Receiver<QueuedOutgoingMessage>,
     mut writer_control_rx: mpsc::Receiver<WebSocketMessage>,
     disconnect_token: CancellationToken,
 ) {
@@ -438,15 +462,18 @@ async fn run_websocket_outbound_loop(
                     break;
                 }
             }
-            outgoing_message = writer_rx.recv() => {
-                let Some(outgoing_message) = outgoing_message else {
+            queued_message = writer_rx.recv() => {
+                let Some(queued_message) = queued_message else {
                     break;
                 };
-                let Some(json) = serialize_outgoing_message(outgoing_message) else {
+                let Some(json) = serialize_outgoing_message(queued_message.message) else {
                     continue;
                 };
                 if websocket_writer.send(WebSocketMessage::Text(json.into())).await.is_err() {
                     break;
+                }
+                if let Some(write_complete_tx) = queued_message.write_complete_tx {
+                    let _ = write_complete_tx.send(());
                 }
             }
         }
@@ -456,7 +483,7 @@ async fn run_websocket_outbound_loop(
 async fn run_websocket_inbound_loop(
     mut websocket_reader: futures::stream::SplitStream<WebSocket>,
     transport_event_tx: mpsc::Sender<TransportEvent>,
-    writer_tx_for_reader: mpsc::Sender<OutgoingMessage>,
+    writer_tx_for_reader: mpsc::Sender<QueuedOutgoingMessage>,
     writer_control_tx: mpsc::Sender<WebSocketMessage>,
     connection_id: ConnectionId,
     disconnect_token: CancellationToken,
@@ -507,7 +534,7 @@ async fn run_websocket_inbound_loop(
 
 async fn forward_incoming_message(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
-    writer: &mpsc::Sender<OutgoingMessage>,
+    writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     payload: &str,
 ) -> bool {
@@ -524,7 +551,7 @@ async fn forward_incoming_message(
 
 async fn enqueue_incoming_message(
     transport_event_tx: &mpsc::Sender<TransportEvent>,
-    writer: &mpsc::Sender<OutgoingMessage>,
+    writer: &mpsc::Sender<QueuedOutgoingMessage>,
     connection_id: ConnectionId,
     message: JSONRPCMessage,
 ) -> bool {
@@ -547,7 +574,7 @@ async fn enqueue_incoming_message(
                     data: None,
                 },
             });
-            match writer.try_send(overload_error) {
+            match writer.try_send(QueuedOutgoingMessage::new(overload_error)) {
                 Ok(()) => true,
                 Err(mpsc::error::TrySendError::Closed(_)) => false,
                 Err(mpsc::error::TrySendError::Full(_overload_error)) => {
@@ -584,16 +611,6 @@ fn should_skip_notification_for_connection(
     connection_state: &OutboundConnectionState,
     message: &OutgoingMessage,
 ) -> bool {
-    if !connection_state.allow_legacy_notifications
-        && matches!(message, OutgoingMessage::Notification(_))
-    {
-        // Raw legacy `codex/event/*` notifications are still emitted upstream
-        // for in-process compatibility, but they are no longer part of the
-        // external app-server contract. Keep dropping them here until the
-        // producer path can be deleted entirely.
-        return true;
-    }
-
     let Ok(opted_out_notification_methods) = connection_state.opted_out_notification_methods.read()
     else {
         warn!("failed to read outbound opted-out notifications");
@@ -603,9 +620,6 @@ fn should_skip_notification_for_connection(
         OutgoingMessage::AppServerNotification(notification) => {
             let method = notification.to_string();
             opted_out_notification_methods.contains(method.as_str())
-        }
-        OutgoingMessage::Notification(notification) => {
-            opted_out_notification_methods.contains(notification.method.as_str())
         }
         _ => false,
     }
@@ -626,6 +640,7 @@ async fn send_message_to_connection(
     connections: &mut HashMap<ConnectionId, OutboundConnectionState>,
     connection_id: ConnectionId,
     message: OutgoingMessage,
+    write_complete_tx: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> bool {
     let Some(connection_state) = connections.get(&connection_id) else {
         warn!("dropping message for disconnected connection: {connection_id:?}");
@@ -637,8 +652,12 @@ async fn send_message_to_connection(
     }
 
     let writer = connection_state.writer.clone();
+    let queued_message = QueuedOutgoingMessage {
+        message,
+        write_complete_tx,
+    };
     if connection_state.can_disconnect() {
-        match writer.try_send(message) {
+        match writer.try_send(queued_message) {
             Ok(()) => false,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 warn!(
@@ -650,7 +669,7 @@ async fn send_message_to_connection(
                 disconnect_connection(connections, connection_id)
             }
         }
-    } else if writer.send(message).await.is_err() {
+    } else if writer.send(queued_message).await.is_err() {
         disconnect_connection(connections, connection_id)
     } else {
         false
@@ -689,8 +708,11 @@ pub(crate) async fn route_outgoing_envelope(
         OutgoingEnvelope::ToConnection {
             connection_id,
             message,
+            write_complete_tx,
         } => {
-            let _ = send_message_to_connection(connections, connection_id, message).await;
+            let _ =
+                send_message_to_connection(connections, connection_id, message, write_complete_tx)
+                    .await;
         }
         OutgoingEnvelope::Broadcast { message } => {
             let target_connections: Vec<ConnectionId> = connections
@@ -707,8 +729,13 @@ pub(crate) async fn route_outgoing_envelope(
                 .collect();
 
             for connection_id in target_connections {
-                let _ =
-                    send_message_to_connection(connections, connection_id, message.clone()).await;
+                let _ = send_message_to_connection(
+                    connections,
+                    connection_id,
+                    message.clone(),
+                    /*write_complete_tx*/ None,
+                )
+                .await;
             }
         }
     }
@@ -719,6 +746,8 @@ mod tests {
     use super::*;
     use crate::error_code::OVERLOADED_ERROR_CODE;
     use codex_app_server_protocol::CommandExecutionRequestApprovalSkillMetadata;
+    use codex_app_server_protocol::ConfigWarningNotification;
+    use codex_app_server_protocol::ServerNotification;
     use codex_utils_absolute_path::AbsolutePathBuf;
     use pretty_assertions::assert_eq;
     use serde_json::json;
@@ -817,7 +846,8 @@ mod tests {
             .recv()
             .await
             .expect("request should receive overload error");
-        let overload_json = serde_json::to_value(overload).expect("serialize overload error");
+        let overload_json =
+            serde_json::to_value(overload.message).expect("serialize overload error");
         assert_eq!(
             overload_json,
             json!({
@@ -921,11 +951,15 @@ mod tests {
             .expect("transport queue should accept first message");
 
         writer_tx
-            .send(OutgoingMessage::Notification(
-                crate::outgoing_message::OutgoingNotification {
-                    method: "queued".to_string(),
-                    params: None,
-                },
+            .send(QueuedOutgoingMessage::new(
+                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "queued".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
             ))
             .await
             .expect("writer queue should accept first message");
@@ -949,8 +983,18 @@ mod tests {
             .recv()
             .await
             .expect("writer queue should still contain original message");
-        let queued_json = serde_json::to_value(queued_outgoing).expect("serialize queued message");
-        assert_eq!(queued_json, json!({ "method": "queued" }));
+        let queued_json =
+            serde_json::to_value(queued_outgoing.message).expect("serialize queued message");
+        assert_eq!(
+            queued_json,
+            json!({
+                "method": "configWarning",
+                "params": {
+                    "summary": "queued",
+                    "details": null,
+                },
+            })
+        );
     }
 
     #[tokio::test]
@@ -958,9 +1002,8 @@ mod tests {
         let connection_id = ConnectionId(7);
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
         let initialized = Arc::new(AtomicBool::new(true));
-        let opted_out_notification_methods = Arc::new(RwLock::new(HashSet::from([
-            "codex/event/task_started".to_string(),
-        ])));
+        let opted_out_notification_methods =
+            Arc::new(RwLock::new(HashSet::from(["configWarning".to_string()])));
 
         let mut connections = HashMap::new();
         connections.insert(
@@ -970,7 +1013,6 @@ mod tests {
                 initialized,
                 Arc::new(AtomicBool::new(true)),
                 opted_out_notification_methods,
-                false,
                 None,
             ),
         );
@@ -979,12 +1021,15 @@ mod tests {
             &mut connections,
             OutgoingEnvelope::ToConnection {
                 connection_id,
-                message: OutgoingMessage::Notification(
-                    crate::outgoing_message::OutgoingNotification {
-                        method: "codex/event/task_started".to_string(),
-                        params: None,
+                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "task_started".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
                     },
-                ),
+                )),
+                write_complete_tx: None,
             },
         )
         .await;
@@ -996,7 +1041,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn to_connection_legacy_notifications_are_dropped_for_external_clients() {
+    async fn to_connection_notifications_are_dropped_for_opted_out_clients() {
         let connection_id = ConnectionId(10);
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
 
@@ -1007,8 +1052,7 @@ mod tests {
                 writer_tx,
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
-                Arc::new(RwLock::new(HashSet::new())),
-                false,
+                Arc::new(RwLock::new(HashSet::from(["configWarning".to_string()]))),
                 None,
             ),
         );
@@ -1017,24 +1061,27 @@ mod tests {
             &mut connections,
             OutgoingEnvelope::ToConnection {
                 connection_id,
-                message: OutgoingMessage::Notification(
-                    crate::outgoing_message::OutgoingNotification {
-                        method: "codex/event/task_started".to_string(),
-                        params: None,
+                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "task_started".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
                     },
-                ),
+                )),
+                write_complete_tx: None,
             },
         )
         .await;
 
         assert!(
             writer_rx.try_recv().is_err(),
-            "legacy notifications should not reach external clients"
+            "opted-out notifications should not reach clients"
         );
     }
 
     #[tokio::test]
-    async fn to_connection_legacy_notifications_are_preserved_for_in_process_clients() {
+    async fn to_connection_notifications_are_preserved_for_non_opted_out_clients() {
         let connection_id = ConnectionId(11);
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
 
@@ -1046,7 +1093,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(RwLock::new(HashSet::new())),
-                true,
                 None,
             ),
         );
@@ -1055,12 +1101,15 @@ mod tests {
             &mut connections,
             OutgoingEnvelope::ToConnection {
                 connection_id,
-                message: OutgoingMessage::Notification(
-                    crate::outgoing_message::OutgoingNotification {
-                        method: "codex/event/task_started".to_string(),
-                        params: None,
+                message: OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "task_started".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
                     },
-                ),
+                )),
+                write_complete_tx: None,
             },
         )
         .await;
@@ -1068,13 +1117,12 @@ mod tests {
         let message = writer_rx
             .recv()
             .await
-            .expect("legacy notification should reach in-process clients");
+            .expect("notification should reach non-opted-out clients");
         assert!(matches!(
-            message,
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method,
-                params: None,
-            }) if method == "codex/event/task_started"
+            message.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "task_started"
         ));
     }
 
@@ -1091,7 +1139,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(false)),
                 Arc::new(RwLock::new(HashSet::new())),
-                false,
                 None,
             ),
         );
@@ -1132,6 +1179,7 @@ mod tests {
                         available_decisions: None,
                     },
                 }),
+                write_complete_tx: None,
             },
         )
         .await;
@@ -1140,7 +1188,7 @@ mod tests {
             .recv()
             .await
             .expect("request should be delivered to the connection");
-        let json = serde_json::to_value(message).expect("request should serialize");
+        let json = serde_json::to_value(message.message).expect("request should serialize");
         assert_eq!(json["params"].get("additionalPermissions"), None);
         assert_eq!(json["params"].get("skillMetadata"), None);
     }
@@ -1158,7 +1206,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(RwLock::new(HashSet::new())),
-                false,
                 None,
             ),
         );
@@ -1199,6 +1246,7 @@ mod tests {
                         available_decisions: None,
                     },
                 }),
+                write_complete_tx: None,
             },
         )
         .await;
@@ -1207,7 +1255,7 @@ mod tests {
             .recv()
             .await
             .expect("request should be delivered to the connection");
-        let json = serde_json::to_value(message).expect("request should serialize");
+        let json = serde_json::to_value(message.message).expect("request should serialize");
         let allowed_path = absolute_path("/tmp/allowed").to_string_lossy().into_owned();
         assert_eq!(
             json["params"]["additionalPermissions"],
@@ -1246,7 +1294,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(RwLock::new(HashSet::new())),
-                false,
                 Some(fast_disconnect_token.clone()),
             ),
         );
@@ -1257,25 +1304,30 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(RwLock::new(HashSet::new())),
-                false,
                 Some(slow_disconnect_token.clone()),
             ),
         );
 
-        let queued_message =
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method: "codex/event/already-buffered".to_string(),
-                params: None,
-            });
+        let queued_message = OutgoingMessage::AppServerNotification(
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "already-buffered".to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+        );
         slow_writer_tx
-            .try_send(queued_message)
+            .try_send(QueuedOutgoingMessage::new(queued_message))
             .expect("channel should have room");
 
-        let broadcast_message =
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method: "codex/event/test".to_string(),
-                params: None,
-            });
+        let broadcast_message = OutgoingMessage::AppServerNotification(
+            ServerNotification::ConfigWarning(ConfigWarningNotification {
+                summary: "test".to_string(),
+                details: None,
+                path: None,
+                range: None,
+            }),
+        );
         timeout(
             Duration::from_millis(100),
             route_outgoing_envelope(
@@ -1286,24 +1338,28 @@ mod tests {
             ),
         )
         .await
-        .expect("broadcast should return even when legacy notifications are dropped");
-        assert!(connections.contains_key(&slow_connection_id));
-        assert!(!slow_disconnect_token.is_cancelled());
+        .expect("broadcast should return even when one connection is slow");
+        assert!(!connections.contains_key(&slow_connection_id));
+        assert!(slow_disconnect_token.is_cancelled());
         assert!(!fast_disconnect_token.is_cancelled());
-        assert!(
-            fast_writer_rx.try_recv().is_err(),
-            "broadcast legacy notification should be dropped for fast connections"
-        );
+        let fast_message = fast_writer_rx
+            .try_recv()
+            .expect("fast connection should receive the broadcast notification");
+        assert!(matches!(
+            fast_message.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "test"
+        ));
 
         let slow_message = slow_writer_rx
             .try_recv()
             .expect("slow connection should retain its original buffered message");
         assert!(matches!(
-            slow_message,
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method,
-                params: None,
-            }) if method == "codex/event/already-buffered"
+            slow_message.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "already-buffered"
         ));
     }
 
@@ -1312,11 +1368,15 @@ mod tests {
         let connection_id = ConnectionId(3);
         let (writer_tx, mut writer_rx) = mpsc::channel(1);
         writer_tx
-            .send(OutgoingMessage::Notification(
-                crate::outgoing_message::OutgoingNotification {
-                    method: "queued".to_string(),
-                    params: None,
-                },
+            .send(QueuedOutgoingMessage::new(
+                OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                    ConfigWarningNotification {
+                        summary: "queued".to_string(),
+                        details: None,
+                        path: None,
+                        range: None,
+                    },
+                )),
             ))
             .await
             .expect("channel should accept the first queued message");
@@ -1329,7 +1389,6 @@ mod tests {
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(AtomicBool::new(true)),
                 Arc::new(RwLock::new(HashSet::new())),
-                false,
                 None,
             ),
         );
@@ -1339,12 +1398,15 @@ mod tests {
                 &mut connections,
                 OutgoingEnvelope::ToConnection {
                     connection_id,
-                    message: OutgoingMessage::Notification(
-                        crate::outgoing_message::OutgoingNotification {
-                            method: "second".to_string(),
-                            params: None,
-                        },
+                    message: OutgoingMessage::AppServerNotification(
+                        ServerNotification::ConfigWarning(ConfigWarningNotification {
+                            summary: "second".to_string(),
+                            details: None,
+                            path: None,
+                            range: None,
+                        }),
                     ),
+                    write_complete_tx: None,
                 },
             )
             .await
@@ -1356,20 +1418,23 @@ mod tests {
             .expect("first queued message should exist");
         timeout(Duration::from_millis(100), route_task)
             .await
-            .expect("routing should finish immediately when legacy notifications are dropped")
+            .expect("routing should finish after the first queued message is drained")
             .expect("routing task should succeed");
 
         assert!(matches!(
-            first,
-            OutgoingMessage::Notification(crate::outgoing_message::OutgoingNotification {
-                method,
-                params: None,
-            }) if method == "queued"
+            first.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "queued"
         ));
+        let second = writer_rx
+            .try_recv()
+            .expect("second notification should be delivered once the queue has room");
         assert!(matches!(
-            writer_rx.try_recv(),
-            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
-                | Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
+            second.message,
+            OutgoingMessage::AppServerNotification(ServerNotification::ConfigWarning(
+                ConfigWarningNotification { summary, .. }
+            )) if summary == "second"
         ));
     }
 }

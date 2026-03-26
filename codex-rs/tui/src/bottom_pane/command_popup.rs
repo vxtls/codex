@@ -38,6 +38,7 @@ pub(crate) struct CommandPopup {
 pub(crate) struct CommandPopupFlags {
     pub(crate) collaboration_modes_enabled: bool,
     pub(crate) connectors_enabled: bool,
+    pub(crate) plugins_command_enabled: bool,
     pub(crate) fast_command_enabled: bool,
     pub(crate) personality_command_enabled: bool,
     pub(crate) realtime_conversation_enabled: bool,
@@ -50,6 +51,7 @@ impl From<CommandPopupFlags> for slash_commands::BuiltinCommandFlags {
         Self {
             collaboration_modes_enabled: value.collaboration_modes_enabled,
             connectors_enabled: value.connectors_enabled,
+            plugins_command_enabled: value.plugins_command_enabled,
             fast_command_enabled: value.fast_command_enabled,
             personality_command_enabled: value.personality_command_enabled,
             realtime_conversation_enabled: value.realtime_conversation_enabled,
@@ -66,6 +68,7 @@ impl CommandPopup {
             slash_commands::builtins_for_input(flags.into())
                 .into_iter()
                 .filter(|(name, _)| !name.starts_with("debug"))
+                .filter(|(_, cmd)| *cmd != SlashCommand::Apps)
                 .collect();
         // Exclude prompts that collide with builtin command names and sort by name.
         let exclude: HashSet<String> = builtins.iter().map(|(n, _)| (*n).to_string()).collect();
@@ -509,6 +512,7 @@ mod tests {
             CommandPopupFlags {
                 collaboration_modes_enabled: true,
                 connectors_enabled: false,
+                plugins_command_enabled: false,
                 fast_command_enabled: false,
                 personality_command_enabled: true,
                 realtime_conversation_enabled: false,
@@ -531,6 +535,7 @@ mod tests {
             CommandPopupFlags {
                 collaboration_modes_enabled: true,
                 connectors_enabled: false,
+                plugins_command_enabled: false,
                 fast_command_enabled: false,
                 personality_command_enabled: true,
                 realtime_conversation_enabled: false,
@@ -553,6 +558,7 @@ mod tests {
             CommandPopupFlags {
                 collaboration_modes_enabled: true,
                 connectors_enabled: false,
+                plugins_command_enabled: false,
                 fast_command_enabled: false,
                 personality_command_enabled: false,
                 realtime_conversation_enabled: false,
@@ -583,6 +589,7 @@ mod tests {
             CommandPopupFlags {
                 collaboration_modes_enabled: true,
                 connectors_enabled: false,
+                plugins_command_enabled: false,
                 fast_command_enabled: false,
                 personality_command_enabled: true,
                 realtime_conversation_enabled: false,
@@ -605,6 +612,7 @@ mod tests {
             CommandPopupFlags {
                 collaboration_modes_enabled: false,
                 connectors_enabled: false,
+                plugins_command_enabled: false,
                 fast_command_enabled: false,
                 personality_command_enabled: true,
                 realtime_conversation_enabled: true,

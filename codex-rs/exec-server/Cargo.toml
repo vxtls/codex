@@ -45,3 +45,4 @@ anyhow = { workspace = true }
 codex-utils-cargo-bin = { workspace = true }
 pretty_assertions = { workspace = true }
 tempfile = { workspace = true }
+test-case = "3.3.1"

@@ -23,6 +23,7 @@ use crate::TypedRequestError;
 use crate::request_method_name;
 use codex_client::log_request_metadata;
 use codex_client::resolve_host_with_doh;
+use crate::server_notification_requires_delivery;
 use codex_app_server_protocol::ClientInfo;
 use codex_app_server_protocol::ClientNotification;
 use codex_app_server_protocol::ClientRequest;
@@ -50,6 +51,8 @@ use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::http::HeaderValue;
+use tokio_tungstenite::tungstenite::http::header::AUTHORIZATION;
 use tracing::warn;
 use url::Url;
 
@@ -59,6 +62,7 @@ const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone)]
 pub struct RemoteAppServerConnectArgs {
     pub websocket_url: String,
+    pub auth_token: Option<String>,
     pub client_name: String,
     pub client_version: String,
     pub experimental_api: bool,
@@ -85,6 +89,16 @@ impl RemoteAppServerConnectArgs {
             },
             capabilities: Some(capabilities),
         }
+    }
+}
+
+pub(crate) fn websocket_url_supports_auth_token(url: &Url) -> bool {
+    match (url.scheme(), url.host()) {
+        ("wss", Some(_)) => true,
+        ("ws", Some(url::Host::Domain(domain))) => domain.eq_ignore_ascii_case("localhost"),
+        ("ws", Some(url::Host::Ipv4(addr))) => addr.is_loopback(),
+        ("ws", Some(url::Host::Ipv6(addr))) => addr.is_loopback(),
+        _ => false,
     }
 }
 
@@ -135,6 +149,14 @@ impl RemoteAppServerClient {
                 format!("invalid websocket URL `{websocket_url}`: {err}"),
             )
         })?;
+        if args.auth_token.is_some() && !websocket_url_supports_auth_token(&url) {
+            return Err(IoError::new(
+                ErrorKind::InvalidInput,
+                format!(
+                    "remote auth tokens require `wss://` or loopback `ws://` URLs; got `{websocket_url}`"
+                ),
+            ));
+        }
         let host = url.host_str().ok_or_else(|| {
             IoError::new(
                 ErrorKind::InvalidInput,
@@ -189,12 +211,23 @@ impl RemoteAppServerClient {
             );
             return Err(IoError::other(message));
         };
-        let request = websocket_url.as_str().into_client_request().map_err(|err| {
+        let mut request = websocket_url.as_str().into_client_request().map_err(|err| {
             IoError::new(
                 ErrorKind::InvalidInput,
                 format!("invalid websocket request `{websocket_url}`: {err}"),
             )
         })?;
+        if let Some(auth_token) = args.auth_token.as_deref() {
+            let header_value = HeaderValue::from_str(&format!("Bearer {auth_token}")).map_err(
+                |err| {
+                    IoError::new(
+                        ErrorKind::InvalidInput,
+                        format!("invalid remote authorization header value: {err}"),
+                    )
+                },
+            )?;
+            request.headers_mut().insert(AUTHORIZATION, header_value);
+        }
         let stream = timeout(
             CONNECT_TIMEOUT,
             client_async_tls_with_config(request, tcp_stream, None, None),
@@ -367,18 +400,19 @@ impl RemoteAppServerClient {
                                         }
                                     }
                                     Ok(JSONRPCMessage::Notification(notification)) => {
-                                        let event = app_server_event_from_notification(notification);
-                                        if let Err(err) = deliver_event(
-                                            &event_tx,
-                                            &mut skipped_events,
-                                            event,
-                                            &mut stream,
-                                        )
-                                        .await
-                                        {
-                                            warn!(%err, "failed to deliver remote app-server event");
-                                            break;
-                                        }
+                                        if let Some(event) =
+                                            app_server_event_from_notification(notification)
+                                            && let Err(err) = deliver_event(
+                                                &event_tx,
+                                                &mut skipped_events,
+                                                event,
+                                                &mut stream,
+                                            )
+                                            .await
+                                            {
+                                                warn!(%err, "failed to deliver remote app-server event");
+                                                break;
+                                            }
                                     }
                                     Ok(JSONRPCMessage::Request(request)) => {
                                         let request_id = request.id.clone();
@@ -768,7 +802,9 @@ async fn initialize_remote_connection(
                             )));
                         }
                         JSONRPCMessage::Notification(notification) => {
-                            pending_events.push(app_server_event_from_notification(notification));
+                            if let Some(event) = app_server_event_from_notification(notification) {
+                                pending_events.push(event);
+                            }
                         }
                         JSONRPCMessage::Request(request) => {
                             let request_id = request.id.clone();
@@ -851,10 +887,10 @@ async fn initialize_remote_connection(
     Ok(pending_events)
 }
 
-fn app_server_event_from_notification(notification: JSONRPCNotification) -> AppServerEvent {
-    match ServerNotification::try_from(notification.clone()) {
-        Ok(notification) => AppServerEvent::ServerNotification(notification),
-        Err(_) => AppServerEvent::LegacyNotification(notification),
+fn app_server_event_from_notification(notification: JSONRPCNotification) -> Option<AppServerEvent> {
+    match ServerNotification::try_from(notification) {
+        Ok(notification) => Some(AppServerEvent::ServerNotification(notification)),
+        Err(_) => None,
     }
 }
 
@@ -946,18 +982,11 @@ async fn reject_if_server_request_dropped(
 
 fn event_requires_delivery(event: &AppServerEvent) -> bool {
     match event {
-        AppServerEvent::ServerNotification(ServerNotification::TurnCompleted(_)) => true,
-        AppServerEvent::LegacyNotification(notification) => matches!(
-            notification
-                .method
-                .strip_prefix("codex/event/")
-                .unwrap_or(&notification.method),
-            "task_complete" | "turn_aborted" | "shutdown_complete"
-        ),
+        AppServerEvent::ServerNotification(notification) => {
+            server_notification_requires_delivery(notification)
+        }
         AppServerEvent::Disconnected { .. } => true,
-        AppServerEvent::Lagged { .. }
-        | AppServerEvent::ServerNotification(_)
-        | AppServerEvent::ServerRequest(_) => false,
+        AppServerEvent::Lagged { .. } | AppServerEvent::ServerRequest(_) => false,
     }
 }
 
@@ -1003,4 +1032,41 @@ async fn write_jsonrpc_message(
                 "failed to write websocket message to `{websocket_url}`: {err}"
             ))
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_requires_delivery_marks_transcript_and_disconnect_events() {
+        assert!(event_requires_delivery(
+            &AppServerEvent::ServerNotification(ServerNotification::AgentMessageDelta(
+                codex_app_server_protocol::AgentMessageDeltaNotification {
+                    thread_id: "thread".to_string(),
+                    turn_id: "turn".to_string(),
+                    item_id: "item".to_string(),
+                    delta: "hello".to_string(),
+                },
+            ),)
+        ));
+        assert!(event_requires_delivery(
+            &AppServerEvent::ServerNotification(ServerNotification::ItemCompleted(
+                codex_app_server_protocol::ItemCompletedNotification {
+                    thread_id: "thread".to_string(),
+                    turn_id: "turn".to_string(),
+                    item: codex_app_server_protocol::ThreadItem::Plan {
+                        id: "item".to_string(),
+                        text: "step".to_string(),
+                    },
+                }
+            ),)
+        ));
+        assert!(event_requires_delivery(&AppServerEvent::Disconnected {
+            message: "closed".to_string(),
+        }));
+        assert!(!event_requires_delivery(&AppServerEvent::Lagged {
+            skipped: 1
+        }));
+    }
 }

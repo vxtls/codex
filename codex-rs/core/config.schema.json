@@ -338,9 +338,6 @@
             "apps": {
               "type": "boolean"
             },
-            "artifact": {
-              "type": "boolean"
-            },
             "child_agents_md": {
               "type": "boolean"
             },
@@ -422,13 +419,13 @@
             "multi_agent": {
               "type": "boolean"
             },
+            "multi_agent_v2": {
+              "type": "boolean"
+            },
             "personality": {
               "type": "boolean"
             },
             "plugins": {
-              "type": "boolean"
-            },
-            "powershell_utf8": {
               "type": "boolean"
             },
             "prevent_idle_sleep": {
@@ -483,6 +480,9 @@
               "type": "boolean"
             },
             "tool_call_mcp_elicitation": {
+              "type": "boolean"
+            },
+            "tool_search": {
               "type": "boolean"
             },
             "tool_suggest": {
@@ -741,6 +741,21 @@
           "type": "string"
         }
       ]
+    },
+    "McpServerToolConfig": {
+      "additionalProperties": false,
+      "description": "Per-tool approval settings for a single MCP server tool.",
+      "properties": {
+        "approval_mode": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AppToolApproval"
+            }
+          ],
+          "description": "Approval mode for this tool."
+        }
+      },
+      "type": "object"
     },
     "MemoriesToml": {
       "additionalProperties": false,
@@ -1264,7 +1279,9 @@
       "type": "object"
     },
     "RawMcpServerConfig": {
-      "additionalProperties": false,
+      "additionalProperties": {
+        "$ref": "#/definitions/McpServerToolConfig"
+      },
       "properties": {
         "args": {
           "default": null,
@@ -1331,6 +1348,11 @@
           },
           "type": "object"
         },
+        "name": {
+          "default": null,
+          "description": "Legacy display-name field accepted for backward compatibility.",
+          "type": "string"
+        },
         "oauth_resource": {
           "default": null,
           "type": "string"
@@ -1361,6 +1383,13 @@
           "default": null,
           "format": "double",
           "type": "number"
+        },
+        "tools": {
+          "additionalProperties": {
+            "$ref": "#/definitions/McpServerToolConfig"
+          },
+          "default": null,
+          "type": "object"
         },
         "url": {
           "type": "string"
@@ -1545,13 +1574,21 @@
         "enabled": {
           "type": "boolean"
         },
+        "name": {
+          "description": "Name-based selector.",
+          "type": "string"
+        },
         "path": {
-          "$ref": "#/definitions/AbsolutePathBuf"
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Path-based selector."
         }
       },
       "required": [
-        "enabled",
-        "path"
+        "enabled"
       ],
       "type": "object"
     },
@@ -1924,10 +1961,6 @@
     "experimental_compact_prompt_file": {
       "$ref": "#/definitions/AbsolutePathBuf"
     },
-    "experimental_exec_server_url": {
-      "description": "Experimental / do not use. Overrides the URL used when connecting to a remote exec server.",
-      "type": "string"
-    },
     "experimental_realtime_start_instructions": {
       "description": "Experimental / do not use. Replaces the built-in realtime start instructions inserted into developer messages when realtime becomes active.",
       "type": "string"
@@ -1963,9 +1996,6 @@
           "type": "boolean"
         },
         "apps": {
-          "type": "boolean"
-        },
-        "artifact": {
           "type": "boolean"
         },
         "child_agents_md": {
@@ -2049,13 +2079,13 @@
         "multi_agent": {
           "type": "boolean"
         },
+        "multi_agent_v2": {
+          "type": "boolean"
+        },
         "personality": {
           "type": "boolean"
         },
         "plugins": {
-          "type": "boolean"
-        },
-        "powershell_utf8": {
           "type": "boolean"
         },
         "prevent_idle_sleep": {
@@ -2110,6 +2140,9 @@
           "type": "boolean"
         },
         "tool_call_mcp_elicitation": {
+          "type": "boolean"
+        },
+        "tool_search": {
           "type": "boolean"
         },
         "tool_suggest": {
