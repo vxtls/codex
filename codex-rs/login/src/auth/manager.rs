@@ -141,7 +141,6 @@ impl CodexAuth {
         auth_credentials_store_mode: AuthCredentialsStoreMode,
     ) -> std::io::Result<Self> {
         let auth_mode = auth_dot_json.resolved_mode();
-        let client = create_client();
         if auth_mode == ApiAuthMode::ApiKey {
             let Some(api_key) = auth_dot_json.openai_api_key.as_deref() else {
                 return Err(std::io::Error::other("API key auth is missing a key."));
@@ -149,6 +148,7 @@ impl CodexAuth {
             return Ok(Self::from_api_key(api_key));
         }
 
+        let client = create_client();
         let storage_mode = auth_dot_json.storage_mode(auth_credentials_store_mode);
         let state = ChatgptAuthState {
             auth_dot_json: Arc::new(Mutex::new(Some(auth_dot_json))),

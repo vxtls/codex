@@ -1927,34 +1927,25 @@ fn resolve_web_search_config(
 fn resolve_networking_runtime_config(
     networking: Option<&NetworkingToml>,
 ) -> std::io::Result<NetworkRuntimeConfig> {
-    #[cfg(test)]
-    if networking.is_none() {
+    let Some(networking) = networking else {
         return Ok(NetworkRuntimeConfig {
-            doh_servers: vec!["https://1.1.1.1/dns-query".to_string()],
+            doh_servers: default_doh_servers(),
             request_log_path: None,
         });
-    }
-
-    let Some(networking) = networking else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "missing required `[networking]` config section",
-        ));
     };
 
-    let Some(doh_servers) = networking.doh_servers.as_ref() else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "missing required `networking.doh_servers` setting",
-        ));
-    };
-
-    let doh_servers = doh_servers
-        .iter()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
+    let doh_servers = networking
+        .doh_servers
+        .as_ref()
+        .map(|doh_servers| {
+            doh_servers
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(default_doh_servers);
     if doh_servers.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1969,6 +1960,17 @@ fn resolve_networking_runtime_config(
             .as_ref()
             .map(AbsolutePathBuf::to_path_buf),
     })
+}
+
+fn default_doh_servers() -> Vec<String> {
+    [
+        "https://1.1.1.1/dns-query",
+        "https://1.0.0.1/dns-query",
+        "https://8.8.8.8/resolve",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
 }
 
 pub(crate) fn resolve_web_search_mode_for_turn(
