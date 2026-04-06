@@ -1929,7 +1929,7 @@ fn resolve_networking_runtime_config(
 ) -> std::io::Result<NetworkRuntimeConfig> {
     let Some(networking) = networking else {
         return Ok(NetworkRuntimeConfig {
-            doh_servers: default_doh_servers(),
+            doh_servers: codex_client::default_doh_servers(),
             request_log_path: None,
         });
     };
@@ -1945,7 +1945,7 @@ fn resolve_networking_runtime_config(
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
         })
-        .unwrap_or_else(default_doh_servers);
+        .unwrap_or_else(codex_client::default_doh_servers);
     if doh_servers.is_empty() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -1960,17 +1960,6 @@ fn resolve_networking_runtime_config(
             .as_ref()
             .map(AbsolutePathBuf::to_path_buf),
     })
-}
-
-fn default_doh_servers() -> Vec<String> {
-    [
-        "https://1.1.1.1/dns-query",
-        "https://1.0.0.1/dns-query",
-        "https://8.8.8.8/resolve",
-    ]
-    .into_iter()
-    .map(ToString::to_string)
-    .collect()
 }
 
 pub(crate) fn resolve_web_search_mode_for_turn(

@@ -26,6 +26,8 @@ pub use crate::networking::NetworkRuntimeConfig;
 pub use crate::networking::NetworkRuntimeConfigError;
 pub use crate::networking::apply_doh_resolver_blocking;
 pub use crate::networking::configure_networking;
+pub use crate::networking::default_doh_servers;
+pub use crate::networking::ensure_networking_configured_with_defaults;
 pub use crate::networking::log_request_metadata;
 pub use crate::networking::resolve_host_with_doh;
 pub use crate::request::Request;

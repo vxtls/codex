@@ -118,37 +118,43 @@ impl DohRecordType {
 static NETWORK_RUNTIME: LazyLock<RwLock<Option<Arc<NetworkRuntime>>>> =
     LazyLock::new(|| RwLock::new(None));
 
+pub fn default_doh_servers() -> Vec<String> {
+    [
+        "https://1.1.1.1/dns-query",
+        "https://1.0.0.1/dns-query",
+        "https://8.8.8.8/resolve",
+    ]
+    .into_iter()
+    .map(ToString::to_string)
+    .collect()
+}
+
 pub fn configure_networking(config: NetworkRuntimeConfig) -> Result<(), NetworkRuntimeConfigError> {
-    if config.doh_servers.is_empty() {
-        return Err(NetworkRuntimeConfigError::EmptyDohServers);
-    }
-
-    let doh_servers = config
-        .doh_servers
-        .iter()
-        .map(|value| validate_doh_server(value))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    let doh_http_client =
-        build_reqwest_client_with_custom_ca_without_doh(reqwest::Client::builder().no_proxy())
-            .map_err(|source| NetworkRuntimeConfigError::BuildDohClient { source })?;
-
-    let request_logger = config
-        .request_log_path
-        .as_ref()
-        .map(RequestMetadataLogger::new)
-        .transpose()?;
-
-    let runtime = Arc::new(NetworkRuntime {
-        doh_servers,
-        doh_http_client,
-        request_logger,
-    });
+    let runtime = Arc::new(build_network_runtime(config)?);
 
     let mut guard = NETWORK_RUNTIME
         .write()
         .map_err(|_| NetworkRuntimeConfigError::RuntimeLockPoisoned)?;
     *guard = Some(runtime);
+    Ok(())
+}
+
+pub fn ensure_networking_configured_with_defaults() -> Result<(), NetworkRuntimeConfigError> {
+    if configured_runtime().is_some() {
+        return Ok(());
+    }
+
+    let runtime = Arc::new(build_network_runtime(NetworkRuntimeConfig {
+        doh_servers: default_doh_servers(),
+        request_log_path: None,
+    })?);
+
+    let mut guard = NETWORK_RUNTIME
+        .write()
+        .map_err(|_| NetworkRuntimeConfigError::RuntimeLockPoisoned)?;
+    if guard.is_none() {
+        *guard = Some(runtime);
+    }
     Ok(())
 }
 
@@ -180,10 +186,10 @@ pub fn log_request_metadata(
 }
 
 pub async fn resolve_host_with_doh(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    ensure_networking_configured_with_defaults().map_err(io::Error::other)?;
     let Some(runtime) = configured_runtime() else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "networking.doh_servers is not configured",
+        return Err(io::Error::other(
+            "networking runtime should be configured after default initialization",
         ));
     };
     let ips = runtime.resolve_host_ips(host).await?;
@@ -202,6 +208,7 @@ pub async fn resolve_host_with_doh(host: &str, port: u16) -> io::Result<Vec<Sock
 pub(crate) fn apply_doh_resolver(
     builder: reqwest::ClientBuilder,
 ) -> Result<reqwest::ClientBuilder, String> {
+    ensure_networking_configured_with_defaults().map_err(|error| error.to_string())?;
     let Some(runtime) = configured_runtime() else {
         return Err("networking runtime is not configured".to_string());
     };
@@ -211,6 +218,7 @@ pub(crate) fn apply_doh_resolver(
 pub fn apply_doh_resolver_blocking(
     builder: reqwest::blocking::ClientBuilder,
 ) -> Result<reqwest::blocking::ClientBuilder, String> {
+    ensure_networking_configured_with_defaults().map_err(|error| error.to_string())?;
     let Some(runtime) = configured_runtime() else {
         return Err("networking runtime is not configured".to_string());
     };
@@ -222,6 +230,36 @@ fn configured_runtime() -> Option<Arc<NetworkRuntime>> {
         .read()
         .ok()
         .and_then(|guard| guard.as_ref().cloned())
+}
+
+fn build_network_runtime(
+    config: NetworkRuntimeConfig,
+) -> Result<NetworkRuntime, NetworkRuntimeConfigError> {
+    if config.doh_servers.is_empty() {
+        return Err(NetworkRuntimeConfigError::EmptyDohServers);
+    }
+
+    let doh_servers = config
+        .doh_servers
+        .iter()
+        .map(|value| validate_doh_server(value))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let doh_http_client =
+        build_reqwest_client_with_custom_ca_without_doh(reqwest::Client::builder().no_proxy())
+            .map_err(|source| NetworkRuntimeConfigError::BuildDohClient { source })?;
+
+    let request_logger = config
+        .request_log_path
+        .as_ref()
+        .map(RequestMetadataLogger::new)
+        .transpose()?;
+
+    Ok(NetworkRuntime {
+        doh_servers,
+        doh_http_client,
+        request_logger,
+    })
 }
 
 impl NetworkRuntime {
@@ -449,4 +487,67 @@ fn unix_timestamp_millis() -> i128 {
         return 0;
     };
     i128::from(duration.as_secs()) * 1000 + i128::from(duration.subsec_millis())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pretty_assertions::assert_eq;
+
+    struct RuntimeResetGuard {
+        previous: Option<Arc<NetworkRuntime>>,
+    }
+
+    impl RuntimeResetGuard {
+        fn clear() -> Self {
+            let mut guard = NETWORK_RUNTIME
+                .write()
+                .expect("network runtime lock should not be poisoned");
+            Self {
+                previous: guard.take(),
+            }
+        }
+    }
+
+    impl Drop for RuntimeResetGuard {
+        fn drop(&mut self) {
+            let mut guard = NETWORK_RUNTIME
+                .write()
+                .expect("network runtime lock should not be poisoned");
+            *guard = self.previous.take();
+        }
+    }
+
+    #[test]
+    fn default_doh_servers_match_expected_values() {
+        assert_eq!(
+            default_doh_servers(),
+            vec![
+                "https://1.1.1.1/dns-query".to_string(),
+                "https://1.0.0.1/dns-query".to_string(),
+                "https://8.8.8.8/resolve".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_doh_resolver_initializes_default_runtime() {
+        let _reset = RuntimeResetGuard::clear();
+
+        assert!(configured_runtime().is_none());
+
+        apply_doh_resolver(reqwest::Client::builder())
+            .expect("DoH resolver should initialize default networking runtime");
+
+        let runtime = configured_runtime()
+            .expect("networking runtime should be configured after applying DoH resolver");
+        assert_eq!(
+            runtime
+                .doh_servers
+                .iter()
+                .map(reqwest::Url::to_string)
+                .collect::<Vec<_>>(),
+            default_doh_servers(),
+        );
+    }
 }
