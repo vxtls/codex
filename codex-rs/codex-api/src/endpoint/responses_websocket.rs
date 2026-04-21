@@ -1,13 +1,12 @@
-use crate::auth::AuthProvider;
-use crate::auth::add_auth_headers_to_header_map;
+use crate::auth::SharedAuthProvider;
 use crate::common::ResponseEvent;
 use crate::common::ResponseStream;
 use crate::common::ResponsesWsRequest;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use crate::rate_limits::parse_rate_limit_event;
-use crate::sse::responses::ResponsesStreamEvent;
-use crate::sse::responses::process_responses_event;
+use crate::sse::ResponsesStreamEvent;
+use crate::sse::process_responses_event;
 use crate::telemetry::WebsocketTelemetry;
 use codex_client::TransportError;
 use codex_client::log_request_metadata;
@@ -232,6 +231,10 @@ impl ResponsesWebsocketConnection {
 
         let current_span = Span::current();
         tokio::spawn(
+            #[expect(
+                clippy::await_holding_invalid_type,
+                reason = "the guard serializes exclusive use of the websocket stream for the lifetime of the response stream"
+            )]
             async move {
                 if let Some(model) = server_model {
                     let _ = tx_event.send(Ok(ResponseEvent::ServerModel(model))).await;
@@ -282,13 +285,13 @@ impl ResponsesWebsocketConnection {
     }
 }
 
-pub struct ResponsesWebsocketClient<A: AuthProvider> {
+pub struct ResponsesWebsocketClient {
     provider: Provider,
-    auth: A,
+    auth: SharedAuthProvider,
 }
 
-impl<A: AuthProvider> ResponsesWebsocketClient<A> {
-    pub fn new(provider: Provider, auth: A) -> Self {
+impl ResponsesWebsocketClient {
+    pub fn new(provider: Provider, auth: SharedAuthProvider) -> Self {
         Self { provider, auth }
     }
 
@@ -312,7 +315,7 @@ impl<A: AuthProvider> ResponsesWebsocketClient<A> {
 
         let mut headers =
             merge_request_headers(&self.provider.headers, extra_headers, default_headers);
-        add_auth_headers_to_header_map(&self.auth, &mut headers);
+        self.auth.add_auth_headers(&mut headers);
 
         let (stream, server_reasoning_included, models_etag, server_model) =
             connect_websocket(ws_url, headers, turn_state.clone()).await?;

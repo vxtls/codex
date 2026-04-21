@@ -31,6 +31,7 @@ pub use crate::networking::ensure_networking_configured_with_defaults;
 pub use crate::networking::log_request_metadata;
 pub use crate::networking::resolve_host_with_doh;
 pub use crate::request::Request;
+pub use crate::request::RequestBody;
 pub use crate::request::RequestCompression;
 pub use crate::request::Response;
 pub use crate::retry::RetryOn;

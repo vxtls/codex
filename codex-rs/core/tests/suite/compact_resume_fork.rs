@@ -158,7 +158,7 @@ async fn compact_resume_and_fork_preserve_model_history_view() {
     // 1. Arrange mocked SSE responses for the initial compact/resume/fork flow.
     let server = MockServer::start().await;
     let request_log = mount_initial_flow(&server).await;
-    let expected_model = "gpt-5.1-codex";
+    let expected_model = "gpt-5.4";
     // 2. Start a new conversation and drive it through the compact/resume/fork steps.
     let (_home, config, manager, base) =
         start_test_conversation(&server, Some(expected_model)).await;
@@ -538,7 +538,7 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
         return Ok(());
     }
 
-    const MODEL: &str = "gpt-5.1-codex";
+    const MODEL: &str = "gpt-5.4";
     const TURN_ONE_USER: &str = "turn 1 user";
     const TURN_TWO_USER: &str = "turn 2 user";
     const FOLLOWUP_USER: &str = "follow-up user";
@@ -567,7 +567,7 @@ async fn snapshot_rollback_followup_turn_trims_context_updates() -> Result<()> {
 
     user_turn(&conversation, TURN_ONE_USER).await;
 
-    let override_cwd = config.cwd.join(PRETURN_CONTEXT_DIFF_CWD)?;
+    let override_cwd = config.cwd.join(PRETURN_CONTEXT_DIFF_CWD);
     std::fs::create_dir_all(&override_cwd)?;
     conversation
         .submit(Op::OverrideTurnContext {
@@ -808,6 +808,7 @@ async fn user_turn(conversation: &Arc<CodexThread>, text: &str) {
                 text_elements: Vec::new(),
             }],
             final_output_json_schema: None,
+            responsesapi_client_metadata: None,
         })
         .await
         .expect("submit user turn");
@@ -843,7 +844,7 @@ async fn resume_conversation(
     path: std::path::PathBuf,
 ) -> Arc<CodexThread> {
     let auth_manager = codex_core::test_support::auth_manager_from_auth(
-        codex_core::CodexAuth::from_api_key("dummy"),
+        codex_login::CodexAuth::from_api_key("dummy"),
     );
     Box::pin(manager.resume_thread_from_rollout(
         config.clone(),

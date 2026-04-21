@@ -1,6 +1,6 @@
-use codex_core::LMSTUDIO_OSS_PROVIDER_ID;
 use codex_core::config::Config;
 use codex_client::build_reqwest_client_with_custom_ca;
+use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use std::io;
 use std::path::Path;
 

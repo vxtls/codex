@@ -123,6 +123,27 @@ fn detects_term_program() {
 }
 
 #[test]
+fn terminal_info_reports_is_zellij() {
+    let zellij = terminal_info(
+        TerminalName::Unknown,
+        /*term_program*/ None,
+        /*version*/ None,
+        /*term*/ None,
+        Some(Multiplexer::Zellij {}),
+    );
+    assert!(zellij.is_zellij());
+
+    let non_zellij = terminal_info(
+        TerminalName::Unknown,
+        /*term_program*/ None,
+        /*version*/ None,
+        /*term*/ None,
+        Some(Multiplexer::Tmux { version: None }),
+    );
+    assert!(!non_zellij.is_zellij());
+}
+
+#[test]
 fn detects_iterm2() {
     let env = FakeEnvironment::new().with_var("ITERM_SESSION_ID", "w0t1p0");
     let terminal = detect_terminal_info_from_env(&env);
@@ -434,6 +455,44 @@ fn detects_wezterm() {
         terminal.user_agent_token(),
         "WezTerm",
         "wezterm_empty_user_agent"
+    );
+
+    let env = FakeEnvironment::new().with_var("TERM", "wezterm");
+    let terminal = detect_terminal_info_from_env(&env);
+    assert_eq!(
+        terminal,
+        terminal_info(
+            TerminalName::WezTerm,
+            /*term_program*/ None,
+            /*version*/ None,
+            Some("wezterm"),
+            /*multiplexer*/ None
+        ),
+        "wezterm_term_info"
+    );
+    assert_eq!(
+        terminal.user_agent_token(),
+        "wezterm",
+        "wezterm_term_user_agent"
+    );
+
+    let env = FakeEnvironment::new().with_var("TERM", "wezterm-mux");
+    let terminal = detect_terminal_info_from_env(&env);
+    assert_eq!(
+        terminal,
+        terminal_info(
+            TerminalName::WezTerm,
+            /*term_program*/ None,
+            /*version*/ None,
+            Some("wezterm-mux"),
+            /*multiplexer*/ None
+        ),
+        "wezterm_mux_term_info"
+    );
+    assert_eq!(
+        terminal.user_agent_token(),
+        "wezterm-mux",
+        "wezterm_mux_term_user_agent"
     );
 }
 

@@ -1,3 +1,4 @@
+use codex_protocol::config_types::ApprovalsReviewer;
 use codex_protocol::config_types::SandboxMode;
 use codex_protocol::config_types::WebSearchMode;
 use codex_protocol::protocol::AskForApproval;
@@ -6,8 +7,11 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use serde::Deserialize;
 use serde::Serialize;
 use serde::de::Error as _;
+use serde::de::value::Error as ValueDeserializerError;
+use serde::de::value::StrDeserializer;
 use std::collections::BTreeMap;
 use std::fmt;
+use wildmatch::WildMatchPattern;
 
 use super::requirements_exec_policy::RequirementsExecPolicy;
 use super::requirements_exec_policy::RequirementsExecPolicyToml;
@@ -78,6 +82,7 @@ impl<T> std::ops::DerefMut for ConstrainedWithSource<T> {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigRequirements {
     pub approval_policy: ConstrainedWithSource<AskForApproval>,
+    pub approvals_reviewer: ConstrainedWithSource<ApprovalsReviewer>,
     pub sandbox_policy: ConstrainedWithSource<SandboxPolicy>,
     pub web_search_mode: ConstrainedWithSource<WebSearchMode>,
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
@@ -86,12 +91,18 @@ pub struct ConfigRequirements {
     pub enforce_residency: ConstrainedWithSource<Option<ResidencyRequirement>>,
     /// Managed network constraints derived from requirements.
     pub network: Option<Sourced<NetworkConstraints>>,
+    /// Managed filesystem constraints derived from requirements.
+    pub filesystem: Option<Sourced<FilesystemConstraints>>,
 }
 
 impl Default for ConfigRequirements {
     fn default() -> Self {
         Self {
             approval_policy: ConstrainedWithSource::new(
+                Constrained::allow_any_from_default(),
+                /*source*/ None,
+            ),
+            approvals_reviewer: ConstrainedWithSource::new(
                 Constrained::allow_any_from_default(),
                 /*source*/ None,
             ),
@@ -111,6 +122,7 @@ impl Default for ConfigRequirements {
                 /*source*/ None,
             ),
             network: None,
+            filesystem: None,
         }
     }
 }
@@ -396,6 +408,126 @@ impl From<NetworkRequirementsToml> for NetworkConstraints {
     }
 }
 
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct FilesystemRequirementsToml {
+    pub deny_read: Option<Vec<FilesystemDenyReadPattern>>,
+}
+
+#[derive(Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct PermissionsRequirementsToml {
+    pub filesystem: Option<FilesystemRequirementsToml>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FilesystemConstraints {
+    pub deny_read: Vec<FilesystemDenyReadPattern>,
+}
+
+impl From<PermissionsRequirementsToml> for FilesystemConstraints {
+    fn from(value: PermissionsRequirementsToml) -> Self {
+        let deny_read = value
+            .filesystem
+            .and_then(|filesystem| filesystem.deny_read)
+            .unwrap_or_default();
+        Self { deny_read }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+#[serde(transparent)]
+pub struct FilesystemDenyReadPattern(String);
+
+impl FilesystemDenyReadPattern {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn contains_glob(&self) -> bool {
+        self.0.chars().any(is_glob_metacharacter)
+    }
+
+    pub fn from_input(input: &str) -> Result<Self, String> {
+        if !input.chars().any(is_glob_metacharacter) {
+            let path = deserialize_absolute_path(input)?;
+            return Ok(Self(path.to_string_lossy().into_owned()));
+        }
+
+        let (directory_prefix, suffix) = split_glob_pattern(input);
+        let normalized_prefix = if directory_prefix.is_empty() {
+            deserialize_absolute_path(".")?
+        } else {
+            deserialize_absolute_path(directory_prefix)?
+        };
+        let normalized_prefix = normalized_prefix.to_string_lossy();
+        let normalized = if suffix.is_empty() {
+            normalized_prefix.into_owned()
+        } else if normalized_prefix == "/" {
+            format!("/{suffix}")
+        } else {
+            format!("{normalized_prefix}/{suffix}")
+        };
+        Ok(Self(normalized))
+    }
+}
+
+impl From<AbsolutePathBuf> for FilesystemDenyReadPattern {
+    fn from(value: AbsolutePathBuf) -> Self {
+        Self(value.to_string_lossy().into_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for FilesystemDenyReadPattern {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let input = String::deserialize(deserializer)?;
+        Self::from_input(&input).map_err(D::Error::custom)
+    }
+}
+
+fn deserialize_absolute_path(input: &str) -> Result<AbsolutePathBuf, String> {
+    AbsolutePathBuf::deserialize(StrDeserializer::<ValueDeserializerError>::new(input))
+        .map_err(|err| err.to_string())
+}
+
+fn split_glob_pattern(input: &str) -> (&str, &str) {
+    let Some(first_glob) = input.find(is_glob_metacharacter) else {
+        return ("", input);
+    };
+    let separator_index = input[..first_glob]
+        .char_indices()
+        .rev()
+        .find(|(_, ch)| is_path_separator(*ch))
+        .map(|(index, _)| index);
+
+    match separator_index {
+        Some(0) => ("/", &input[1..]),
+        Some(index)
+            if cfg!(windows)
+                && index == 2
+                && input.as_bytes().get(1) == Some(&b':')
+                && input.as_bytes().get(2).is_some() =>
+        {
+            (&input[..=index], &input[index + 1..])
+        }
+        Some(index) => (&input[..index], &input[index + 1..]),
+        None => ("", input),
+    }
+}
+
+fn is_path_separator(ch: char) -> bool {
+    if cfg!(windows) {
+        ch == '/' || ch == '\\'
+    } else {
+        ch == '/'
+    }
+}
+
+fn is_glob_metacharacter(ch: char) -> bool {
+    matches!(ch, '*' | '?' | '[')
+}
+
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "lowercase")]
 pub enum WebSearchModeRequirement {
@@ -487,7 +619,9 @@ pub(crate) fn merge_enablement_settings_descending(
 #[derive(Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsToml {
     pub allowed_approval_policies: Option<Vec<AskForApproval>>,
+    pub allowed_approvals_reviewers: Option<Vec<ApprovalsReviewer>>,
     pub allowed_sandbox_modes: Option<Vec<SandboxModeRequirement>>,
+    pub remote_sandbox_config: Option<Vec<RemoteSandboxConfigToml>>,
     pub allowed_web_search_modes: Option<Vec<WebSearchModeRequirement>>,
     #[serde(rename = "features", alias = "feature_requirements")]
     pub feature_requirements: Option<FeatureRequirementsToml>,
@@ -497,7 +631,14 @@ pub struct ConfigRequirementsToml {
     pub enforce_residency: Option<ResidencyRequirement>,
     #[serde(rename = "experimental_network")]
     pub network: Option<NetworkRequirementsToml>,
-    pub guardian_developer_instructions: Option<String>,
+    pub permissions: Option<PermissionsRequirementsToml>,
+    pub guardian_policy_config: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone, PartialEq)]
+pub struct RemoteSandboxConfigToml {
+    pub hostname_patterns: Vec<String>,
+    pub allowed_sandbox_modes: Vec<SandboxModeRequirement>,
 }
 
 /// Value paired with the requirement source it came from, for better error
@@ -525,6 +666,7 @@ impl<T> std::ops::Deref for Sourced<T> {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ConfigRequirementsWithSources {
     pub allowed_approval_policies: Option<Sourced<Vec<AskForApproval>>>,
+    pub allowed_approvals_reviewers: Option<Sourced<Vec<ApprovalsReviewer>>>,
     pub allowed_sandbox_modes: Option<Sourced<Vec<SandboxModeRequirement>>>,
     pub allowed_web_search_modes: Option<Sourced<Vec<WebSearchModeRequirement>>>,
     pub feature_requirements: Option<Sourced<FeatureRequirementsToml>>,
@@ -533,7 +675,8 @@ pub struct ConfigRequirementsWithSources {
     pub rules: Option<Sourced<RequirementsExecPolicyToml>>,
     pub enforce_residency: Option<Sourced<ResidencyRequirement>>,
     pub network: Option<Sourced<NetworkRequirementsToml>>,
-    pub guardian_developer_instructions: Option<Sourced<String>>,
+    pub permissions: Option<Sourced<PermissionsRequirementsToml>>,
+    pub guardian_policy_config: Option<Sourced<String>>,
 }
 
 impl ConfigRequirementsWithSources {
@@ -556,7 +699,9 @@ impl ConfigRequirementsWithSources {
         // forces this merge logic to be updated.
         let ConfigRequirementsToml {
             allowed_approval_policies: _,
+            allowed_approvals_reviewers: _,
             allowed_sandbox_modes: _,
+            remote_sandbox_config: _,
             allowed_web_search_modes: _,
             feature_requirements: _,
             mcp_servers: _,
@@ -564,16 +709,17 @@ impl ConfigRequirementsWithSources {
             rules: _,
             enforce_residency: _,
             network: _,
-            guardian_developer_instructions: _,
+            permissions: _,
+            guardian_policy_config: _,
         } = &other;
 
         let mut other = other;
         if other
-            .guardian_developer_instructions
+            .guardian_policy_config
             .as_deref()
             .is_some_and(|value| value.trim().is_empty())
         {
-            other.guardian_developer_instructions = None;
+            other.guardian_policy_config = None;
         }
         fill_missing_take!(
             self,
@@ -581,6 +727,7 @@ impl ConfigRequirementsWithSources {
             source,
             {
                 allowed_approval_policies,
+                allowed_approvals_reviewers,
                 allowed_sandbox_modes,
                 allowed_web_search_modes,
                 feature_requirements,
@@ -588,7 +735,8 @@ impl ConfigRequirementsWithSources {
                 rules,
                 enforce_residency,
                 network,
-                guardian_developer_instructions,
+                permissions,
+                guardian_policy_config,
             }
         );
 
@@ -604,6 +752,7 @@ impl ConfigRequirementsWithSources {
     pub fn into_toml(self) -> ConfigRequirementsToml {
         let ConfigRequirementsWithSources {
             allowed_approval_policies,
+            allowed_approvals_reviewers,
             allowed_sandbox_modes,
             allowed_web_search_modes,
             feature_requirements,
@@ -612,11 +761,14 @@ impl ConfigRequirementsWithSources {
             rules,
             enforce_residency,
             network,
-            guardian_developer_instructions,
+            permissions,
+            guardian_policy_config,
         } = self;
         ConfigRequirementsToml {
             allowed_approval_policies: allowed_approval_policies.map(|sourced| sourced.value),
+            allowed_approvals_reviewers: allowed_approvals_reviewers.map(|sourced| sourced.value),
             allowed_sandbox_modes: allowed_sandbox_modes.map(|sourced| sourced.value),
+            remote_sandbox_config: None,
             allowed_web_search_modes: allowed_web_search_modes.map(|sourced| sourced.value),
             feature_requirements: feature_requirements.map(|sourced| sourced.value),
             mcp_servers: mcp_servers.map(|sourced| sourced.value),
@@ -624,10 +776,23 @@ impl ConfigRequirementsWithSources {
             rules: rules.map(|sourced| sourced.value),
             enforce_residency: enforce_residency.map(|sourced| sourced.value),
             network: network.map(|sourced| sourced.value),
-            guardian_developer_instructions: guardian_developer_instructions
-                .map(|sourced| sourced.value),
+            permissions: permissions.map(|sourced| sourced.value),
+            guardian_policy_config: guardian_policy_config.map(|sourced| sourced.value),
         }
     }
+}
+
+fn normalize_hostname(hostname: &str) -> Option<String> {
+    let hostname = hostname.trim().trim_end_matches('.');
+    (!hostname.is_empty()).then(|| hostname.to_ascii_lowercase())
+}
+
+fn hostname_matches_any_pattern(hostname: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        normalize_hostname(pattern)
+            .map(|pattern| WildMatchPattern::<'*', '?'>::new_case_insensitive(&pattern))
+            .is_some_and(|pattern| pattern.matches(hostname))
+    })
 }
 
 /// Currently, `external-sandbox` is not supported in config.toml, but it is
@@ -664,9 +829,27 @@ pub enum ResidencyRequirement {
 }
 
 impl ConfigRequirementsToml {
+    pub fn apply_remote_sandbox_config(&mut self, hostname: Option<&str>) {
+        let Some(hostname) = hostname.and_then(normalize_hostname) else {
+            return;
+        };
+        let Some(remote_sandbox_config) = self.remote_sandbox_config.as_ref() else {
+            return;
+        };
+        let Some(matched_config) = remote_sandbox_config
+            .iter()
+            .find(|config| hostname_matches_any_pattern(&hostname, &config.hostname_patterns))
+        else {
+            return;
+        };
+        self.allowed_sandbox_modes = Some(matched_config.allowed_sandbox_modes.clone());
+    }
+
     pub fn is_empty(&self) -> bool {
         self.allowed_approval_policies.is_none()
+            && self.allowed_approvals_reviewers.is_none()
             && self.allowed_sandbox_modes.is_none()
+            && self.remote_sandbox_config.is_none()
             && self.allowed_web_search_modes.is_none()
             && self
                 .feature_requirements
@@ -680,8 +863,9 @@ impl ConfigRequirementsToml {
             && self.rules.is_none()
             && self.enforce_residency.is_none()
             && self.network.is_none()
+            && self.permissions.is_none()
             && self
-                .guardian_developer_instructions
+                .guardian_policy_config
                 .as_deref()
                 .is_none_or(|value| value.trim().is_empty())
     }
@@ -693,6 +877,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
     fn try_from(toml: ConfigRequirementsWithSources) -> Result<Self, Self::Error> {
         let ConfigRequirementsWithSources {
             allowed_approval_policies,
+            allowed_approvals_reviewers,
             allowed_sandbox_modes,
             allowed_web_search_modes,
             feature_requirements,
@@ -701,7 +886,8 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             rules,
             enforce_residency,
             network,
-            guardian_developer_instructions: _guardian_developer_instructions,
+            permissions,
+            guardian_policy_config: _guardian_policy_config,
         } = toml;
 
         let approval_policy = match allowed_approval_policies {
@@ -722,6 +908,36 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
                             field_name: "approval_policy",
                             candidate: format!("{candidate:?}"),
                             allowed: format!("{policies:?}"),
+                            requirement_source: requirement_source_for_error.clone(),
+                        })
+                    }
+                })?;
+                ConstrainedWithSource::new(constrained, Some(requirement_source))
+            }
+            None => ConstrainedWithSource::new(
+                Constrained::allow_any_from_default(),
+                /*source*/ None,
+            ),
+        };
+
+        let approvals_reviewer = match allowed_approvals_reviewers {
+            Some(Sourced {
+                value: reviewers,
+                source: requirement_source,
+            }) => {
+                let Some(initial_value) = reviewers.first().copied() else {
+                    return Err(ConstraintError::empty_field("allowed_approvals_reviewers"));
+                };
+
+                let requirement_source_for_error = requirement_source.clone();
+                let constrained = Constrained::new(initial_value, move |candidate| {
+                    if reviewers.contains(candidate) {
+                        Ok(())
+                    } else {
+                        Err(ConstraintError::InvalidValue {
+                            field_name: "approvals_reviewer",
+                            candidate: format!("{candidate:?}"),
+                            allowed: format!("{reviewers:?}"),
                             requirement_source: requirement_source_for_error.clone(),
                         })
                     }
@@ -876,8 +1092,13 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             let Sourced { value, source } = sourced_network;
             Sourced::new(NetworkConstraints::from(value), source)
         });
+        let filesystem = permissions.map(|sourced_permissions| {
+            let Sourced { value, source } = sourced_permissions;
+            Sourced::new(FilesystemConstraints::from(value), source)
+        });
         Ok(ConfigRequirements {
             approval_policy,
+            approvals_reviewer,
             sandbox_policy,
             web_search_mode,
             feature_requirements,
@@ -885,6 +1106,7 @@ impl TryFrom<ConfigRequirementsWithSources> for ConfigRequirements {
             exec_policy,
             enforce_residency,
             network,
+            filesystem,
         })
     }
 }
@@ -898,6 +1120,7 @@ mod tests {
     use codex_execpolicy::RuleMatch;
     use codex_protocol::protocol::NetworkAccess;
     use codex_utils_absolute_path::AbsolutePathBuf;
+    use codex_utils_absolute_path::AbsolutePathBufGuard;
     use pretty_assertions::assert_eq;
     use toml::from_str;
 
@@ -914,7 +1137,9 @@ mod tests {
     fn with_unknown_source(toml: ConfigRequirementsToml) -> ConfigRequirementsWithSources {
         let ConfigRequirementsToml {
             allowed_approval_policies,
+            allowed_approvals_reviewers,
             allowed_sandbox_modes,
+            remote_sandbox_config: _,
             allowed_web_search_modes,
             feature_requirements,
             mcp_servers,
@@ -922,10 +1147,13 @@ mod tests {
             rules,
             enforce_residency,
             network,
-            guardian_developer_instructions,
+            permissions,
+            guardian_policy_config,
         } = toml;
         ConfigRequirementsWithSources {
             allowed_approval_policies: allowed_approval_policies
+                .map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            allowed_approvals_reviewers: allowed_approvals_reviewers
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             allowed_sandbox_modes: allowed_sandbox_modes
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
@@ -939,7 +1167,8 @@ mod tests {
             enforce_residency: enforce_residency
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
             network: network.map(|value| Sourced::new(value, RequirementSource::Unknown)),
-            guardian_developer_instructions: guardian_developer_instructions
+            permissions: permissions.map(|value| Sourced::new(value, RequirementSource::Unknown)),
+            guardian_policy_config: guardian_policy_config
                 .map(|value| Sourced::new(value, RequirementSource::Unknown)),
         }
     }
@@ -950,6 +1179,8 @@ mod tests {
         let source = RequirementSource::LegacyManagedConfigTomlFromMdm;
 
         let allowed_approval_policies = vec![AskForApproval::UnlessTrusted, AskForApproval::Never];
+        let allowed_approvals_reviewers =
+            vec![ApprovalsReviewer::GuardianSubagent, ApprovalsReviewer::User];
         let allowed_sandbox_modes = vec![
             SandboxModeRequirement::WorkspaceWrite,
             SandboxModeRequirement::DangerFullAccess,
@@ -963,14 +1194,15 @@ mod tests {
         };
         let enforce_residency = ResidencyRequirement::Us;
         let enforce_source = source.clone();
-        let guardian_developer_instructions =
-            "Use the company-managed guardian policy.".to_string();
+        let guardian_policy_config = "Use the company-managed guardian policy.".to_string();
 
         // Intentionally constructed without `..Default::default()` so adding a new field to
         // `ConfigRequirementsToml` forces this test to be updated.
         let other = ConfigRequirementsToml {
             allowed_approval_policies: Some(allowed_approval_policies.clone()),
+            allowed_approvals_reviewers: Some(allowed_approvals_reviewers.clone()),
             allowed_sandbox_modes: Some(allowed_sandbox_modes.clone()),
+            remote_sandbox_config: None,
             allowed_web_search_modes: Some(allowed_web_search_modes.clone()),
             feature_requirements: Some(feature_requirements.clone()),
             mcp_servers: None,
@@ -978,7 +1210,8 @@ mod tests {
             rules: None,
             enforce_residency: Some(enforce_residency),
             network: None,
-            guardian_developer_instructions: Some(guardian_developer_instructions.clone()),
+            permissions: None,
+            guardian_policy_config: Some(guardian_policy_config.clone()),
         };
 
         target.merge_unset_fields(source.clone(), other);
@@ -989,6 +1222,10 @@ mod tests {
                 allowed_approval_policies: Some(Sourced::new(
                     allowed_approval_policies,
                     source.clone()
+                )),
+                allowed_approvals_reviewers: Some(Sourced::new(
+                    allowed_approvals_reviewers,
+                    source.clone(),
                 )),
                 allowed_sandbox_modes: Some(Sourced::new(allowed_sandbox_modes, source.clone(),)),
                 allowed_web_search_modes: Some(Sourced::new(
@@ -1004,10 +1241,8 @@ mod tests {
                 rules: None,
                 enforce_residency: Some(Sourced::new(enforce_residency, enforce_source)),
                 network: None,
-                guardian_developer_instructions: Some(Sourced::new(
-                    guardian_developer_instructions,
-                    source,
-                )),
+                permissions: None,
+                guardian_policy_config: Some(Sourced::new(guardian_policy_config, source)),
             }
         );
     }
@@ -1034,6 +1269,7 @@ mod tests {
                     vec![AskForApproval::OnRequest],
                     source_location,
                 )),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
                 feature_requirements: None,
@@ -1042,7 +1278,8 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
-                guardian_developer_instructions: None,
+                permissions: None,
+                guardian_policy_config: None,
             }
         );
         Ok(())
@@ -1077,6 +1314,7 @@ mod tests {
                     vec![AskForApproval::Never],
                     existing_source,
                 )),
+                allowed_approvals_reviewers: None,
                 allowed_sandbox_modes: None,
                 allowed_web_search_modes: None,
                 feature_requirements: None,
@@ -1085,7 +1323,8 @@ mod tests {
                 rules: None,
                 enforce_residency: None,
                 network: None,
-                guardian_developer_instructions: None,
+                permissions: None,
+                guardian_policy_config: None,
             }
         );
         Ok(())
@@ -1097,7 +1336,7 @@ mod tests {
         target.merge_unset_fields(
             RequirementSource::CloudRequirements,
             ConfigRequirementsToml {
-                guardian_developer_instructions: Some("   \n\t".to_string()),
+                guardian_policy_config: Some("   \n\t".to_string()),
                 ..Default::default()
             },
         );
@@ -1107,15 +1346,13 @@ mod tests {
                     .expect("system requirements.toml path"),
             },
             ConfigRequirementsToml {
-                guardian_developer_instructions: Some(
-                    "Use the system guardian policy.".to_string(),
-                ),
+                guardian_policy_config: Some("Use the system guardian policy.".to_string()),
                 ..Default::default()
             },
         );
 
         assert_eq!(
-            target.guardian_developer_instructions,
+            target.guardian_policy_config,
             Some(Sourced::new(
                 "Use the system guardian policy.".to_string(),
                 RequirementSource::SystemRequirementsToml {
@@ -1127,33 +1364,110 @@ mod tests {
     }
 
     #[test]
-    fn deserialize_guardian_developer_instructions() -> Result<()> {
+    fn deserialize_guardian_policy_config() -> Result<()> {
         let requirements: ConfigRequirementsToml = from_str(
             r#"
-guardian_developer_instructions = """
+guardian_policy_config = """
 Use the cloud-managed guardian policy.
 """
 "#,
         )?;
 
         assert_eq!(
-            requirements.guardian_developer_instructions.as_deref(),
+            requirements.guardian_policy_config.as_deref(),
             Some("Use the cloud-managed guardian policy.\n")
         );
         Ok(())
     }
 
     #[test]
-    fn blank_guardian_developer_instructions_is_empty() -> Result<()> {
+    fn blank_guardian_policy_config_is_empty() -> Result<()> {
         let requirements: ConfigRequirementsToml = from_str(
             r#"
-guardian_developer_instructions = """
+guardian_policy_config = """
 
 """
 "#,
         )?;
 
         assert!(requirements.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn allowed_approvals_reviewers_is_not_empty() -> Result<()> {
+        let requirements: ConfigRequirementsToml = from_str(
+            r#"
+allowed_approvals_reviewers = ["user"]
+"#,
+        )?;
+
+        assert!(!requirements.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_filesystem_deny_read_requirements() -> Result<()> {
+        let deny_read_0 = if cfg!(windows) {
+            r"C:\Users\alice\.gitconfig"
+        } else {
+            "/home/alice/.gitconfig"
+        };
+        let deny_read_1 = if cfg!(windows) {
+            r"C:\Users\alice\.ssh"
+        } else {
+            "/home/alice/.ssh"
+        };
+        let toml_str = format!(
+            r#"
+            [permissions.filesystem]
+            deny_read = [{deny_read_0:?}, {deny_read_1:?}]
+        "#
+        );
+
+        let config: ConfigRequirementsToml = from_str(&toml_str)?;
+        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
+
+        assert_eq!(
+            requirements.filesystem,
+            Some(Sourced::new(
+                FilesystemConstraints {
+                    deny_read: vec![
+                        AbsolutePathBuf::from_absolute_path(deny_read_0)?.into(),
+                        AbsolutePathBuf::from_absolute_path(deny_read_1)?.into(),
+                    ],
+                },
+                RequirementSource::Unknown,
+            ))
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_filesystem_deny_read_glob_requirements() -> Result<()> {
+        let temp_dir = std::env::temp_dir();
+        let _guard = AbsolutePathBufGuard::new(&temp_dir);
+        let config: ConfigRequirementsToml = from_str(
+            r#"
+            [permissions.filesystem]
+            deny_read = ["./private/**/*.txt"]
+        "#,
+        )?;
+        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
+
+        assert_eq!(
+            requirements.filesystem,
+            Some(Sourced::new(
+                FilesystemConstraints {
+                    deny_read: vec![
+                        FilesystemDenyReadPattern::from_input("./private/**/*.txt")
+                            .expect("normalize glob pattern"),
+                    ],
+                },
+                RequirementSource::Unknown,
+            ))
+        );
         Ok(())
     }
 
@@ -1330,6 +1644,7 @@ guardian_developer_instructions = """
         let source: ConfigRequirementsToml = from_str(
             r#"
                 allowed_approval_policies = ["on-request"]
+                allowed_approvals_reviewers = ["guardian_subagent"]
                 allowed_sandbox_modes = ["read-only"]
             "#,
         )?;
@@ -1360,6 +1675,17 @@ guardian_developer_instructions = """
                 field_name: "sandbox_mode",
                 candidate: "DangerFullAccess".into(),
                 allowed: "[ReadOnly]".into(),
+                requirement_source: source_location.clone(),
+            })
+        );
+        assert_eq!(
+            requirements
+                .approvals_reviewer
+                .can_set(&ApprovalsReviewer::User),
+            Err(ConstraintError::InvalidValue {
+                field_name: "approvals_reviewer",
+                candidate: "User".into(),
+                allowed: "[GuardianSubagent]".into(),
                 requirement_source: source_location,
             })
         );
@@ -1399,6 +1725,7 @@ guardian_developer_instructions = """
         let source: ConfigRequirementsToml = from_str(
             r#"
                 allowed_approval_policies = ["on-request"]
+                allowed_approvals_reviewers = ["guardian_subagent"]
                 allowed_sandbox_modes = ["read-only"]
                 allowed_web_search_modes = ["cached"]
                 enforce_residency = "us"
@@ -1414,6 +1741,10 @@ guardian_developer_instructions = """
 
         assert_eq!(
             requirements.approval_policy.source,
+            Some(source_location.clone())
+        );
+        assert_eq!(
+            requirements.approvals_reviewer.source,
             Some(source_location.clone())
         );
         assert_eq!(
@@ -1492,6 +1823,54 @@ guardian_developer_instructions = """
     }
 
     #[test]
+    fn deserialize_allowed_approvals_reviewers() -> Result<()> {
+        let toml_str = r#"
+            allowed_approvals_reviewers = ["guardian_subagent", "user"]
+        "#;
+        let config: ConfigRequirementsToml = from_str(toml_str)?;
+        let requirements: ConfigRequirements = with_unknown_source(config).try_into()?;
+
+        assert_eq!(
+            requirements.approvals_reviewer.value(),
+            ApprovalsReviewer::GuardianSubagent,
+            "currently, there is no way to specify the default value for approvals reviewer in the toml, so it picks the first allowed value"
+        );
+        assert!(
+            requirements
+                .approvals_reviewer
+                .can_set(&ApprovalsReviewer::GuardianSubagent)
+                .is_ok()
+        );
+        assert!(
+            requirements
+                .approvals_reviewer
+                .can_set(&ApprovalsReviewer::User)
+                .is_ok()
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn empty_allowed_approvals_reviewers_is_rejected() -> Result<()> {
+        let toml_str = r#"
+            allowed_approvals_reviewers = []
+        "#;
+        let config: ConfigRequirementsToml = from_str(toml_str)?;
+        let err = ConfigRequirements::try_from(with_unknown_source(config))
+            .expect_err("empty approvals reviewer allow-list should be rejected");
+
+        assert_eq!(
+            err,
+            ConstraintError::EmptyField {
+                field_name: "allowed_approvals_reviewers".to_string(),
+            }
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn deserialize_allowed_sandbox_modes() -> Result<()> {
         let toml_str = r#"
             allowed_sandbox_modes = ["read-only", "workspace-write"]
@@ -1540,6 +1919,172 @@ guardian_developer_instructions = """
                 candidate: "ExternalSandbox".into(),
                 allowed: "[ReadOnly, WorkspaceWrite]".into(),
                 requirement_source: RequirementSource::Unknown,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn deserialize_remote_sandbox_config_requires_hostname_patterns_list() -> Result<()> {
+        let toml_str = r#"
+            [[remote_sandbox_config]]
+            hostname_patterns = ["*.org", "runner-??.ci"]
+            allowed_sandbox_modes = ["read-only", "workspace-write"]
+        "#;
+        let config: ConfigRequirementsToml = from_str(toml_str)?;
+
+        assert_eq!(
+            config.remote_sandbox_config,
+            Some(vec![RemoteSandboxConfigToml {
+                hostname_patterns: vec!["*.org".to_string(), "runner-??.ci".to_string()],
+                allowed_sandbox_modes: vec![
+                    SandboxModeRequirement::ReadOnly,
+                    SandboxModeRequirement::WorkspaceWrite,
+                ],
+            }])
+        );
+
+        let err = from_str::<ConfigRequirementsToml>(
+            r#"
+                [[remote_sandbox_config]]
+                hostname_patterns = "*.org"
+                allowed_sandbox_modes = ["read-only"]
+            "#,
+        )
+        .expect_err("hostname_patterns should be list-only");
+        assert!(
+            err.to_string().contains("invalid type: string"),
+            "unexpected error: {err}"
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_sandbox_config_first_match_overrides_top_level() -> Result<()> {
+        let source = RequirementSource::CloudRequirements;
+        let mut requirements_toml: ConfigRequirementsToml = from_str(
+            r#"
+                allowed_sandbox_modes = ["read-only"]
+
+                [[remote_sandbox_config]]
+                hostname_patterns = ["build-*.example.com"]
+                allowed_sandbox_modes = ["read-only", "workspace-write"]
+
+                [[remote_sandbox_config]]
+                hostname_patterns = ["build-01.example.com"]
+                allowed_sandbox_modes = ["read-only", "danger-full-access"]
+            "#,
+        )?;
+        requirements_toml.apply_remote_sandbox_config(Some("BUILD-01.EXAMPLE.COM."));
+        let mut requirements_with_sources = ConfigRequirementsWithSources::default();
+        requirements_with_sources.merge_unset_fields(source.clone(), requirements_toml);
+
+        assert_eq!(
+            requirements_with_sources
+                .allowed_sandbox_modes
+                .as_ref()
+                .map(|sourced| sourced.value.clone()),
+            Some(vec![
+                SandboxModeRequirement::ReadOnly,
+                SandboxModeRequirement::WorkspaceWrite,
+            ])
+        );
+
+        let requirements = ConfigRequirements::try_from(requirements_with_sources)?;
+        let root = if cfg!(windows) { "C:\\repo" } else { "/repo" };
+        assert!(
+            requirements
+                .sandbox_policy
+                .can_set(&SandboxPolicy::WorkspaceWrite {
+                    writable_roots: vec![AbsolutePathBuf::from_absolute_path(root)?],
+                    read_only_access: Default::default(),
+                    network_access: false,
+                    exclude_tmpdir_env_var: false,
+                    exclude_slash_tmp: false,
+                })
+                .is_ok()
+        );
+        assert_eq!(
+            requirements
+                .sandbox_policy
+                .can_set(&SandboxPolicy::DangerFullAccess),
+            Err(ConstraintError::InvalidValue {
+                field_name: "sandbox_mode",
+                candidate: "DangerFullAccess".into(),
+                allowed: "[ReadOnly, WorkspaceWrite]".into(),
+                requirement_source: source,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_sandbox_config_non_match_preserves_top_level() -> Result<()> {
+        let mut requirements_toml: ConfigRequirementsToml = from_str(
+            r#"
+                allowed_sandbox_modes = ["read-only"]
+
+                [[remote_sandbox_config]]
+                hostname_patterns = ["build-*.example.com"]
+                allowed_sandbox_modes = ["read-only", "workspace-write"]
+            "#,
+        )?;
+        requirements_toml.apply_remote_sandbox_config(Some("laptop.example.com"));
+        let mut requirements_with_sources = ConfigRequirementsWithSources::default();
+        requirements_with_sources.merge_unset_fields(RequirementSource::Unknown, requirements_toml);
+        let requirements = ConfigRequirements::try_from(requirements_with_sources)?;
+
+        assert_eq!(
+            requirements
+                .sandbox_policy
+                .can_set(&SandboxPolicy::DangerFullAccess),
+            Err(ConstraintError::InvalidValue {
+                field_name: "sandbox_mode",
+                candidate: "DangerFullAccess".into(),
+                allowed: "[ReadOnly]".into(),
+                requirement_source: RequirementSource::Unknown,
+            })
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn remote_sandbox_config_does_not_override_higher_precedence_sandbox_modes() -> Result<()> {
+        let high_source = RequirementSource::CloudRequirements;
+        let mut high_precedence: ConfigRequirementsToml = from_str(
+            r#"
+                allowed_sandbox_modes = ["read-only"]
+            "#,
+        )?;
+        high_precedence.apply_remote_sandbox_config(Some("runner-01.ci.example.com"));
+
+        let mut low_precedence: ConfigRequirementsToml = from_str(
+            r#"
+                [[remote_sandbox_config]]
+                hostname_patterns = ["runner-*.ci.example.com"]
+                allowed_sandbox_modes = ["read-only", "workspace-write"]
+            "#,
+        )?;
+        low_precedence.apply_remote_sandbox_config(Some("runner-01.ci.example.com"));
+
+        let mut requirements_with_sources = ConfigRequirementsWithSources::default();
+        requirements_with_sources.merge_unset_fields(high_source.clone(), high_precedence);
+        requirements_with_sources.merge_unset_fields(RequirementSource::Unknown, low_precedence);
+        let requirements = ConfigRequirements::try_from(requirements_with_sources)?;
+
+        assert_eq!(
+            requirements
+                .sandbox_policy
+                .can_set(&SandboxPolicy::new_workspace_write_policy()),
+            Err(ConstraintError::InvalidValue {
+                field_name: "sandbox_mode",
+                candidate: "WorkspaceWrite".into(),
+                allowed: "[ReadOnly]".into(),
+                requirement_source: high_source,
             })
         );
 

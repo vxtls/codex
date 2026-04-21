@@ -1,5 +1,8 @@
 use super::*;
-use crate::auth_env_telemetry::AuthEnvTelemetry;
+use codex_feedback::FeedbackRequestTags;
+use codex_feedback::emit_feedback_request_tags;
+use codex_feedback::emit_feedback_request_tags_with_auth_env;
+use codex_login::AuthEnvTelemetry;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -17,7 +20,7 @@ fn feedback_tags_macro_compiles() {
     #[derive(Debug)]
     struct OnlyDebug;
 
-    feedback_tags!(model = "gpt-5", cached = true, debug_only = OnlyDebug);
+    feedback_tags!(model = "gpt-5.2", cached = true, debug_only = OnlyDebug);
 }
 
 #[derive(Default)]
