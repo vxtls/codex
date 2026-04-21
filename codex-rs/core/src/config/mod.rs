@@ -37,6 +37,7 @@ use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
 use codex_config::types::McpServerTransportConfig;
 use codex_config::types::MemoriesConfig;
+use codex_config::types::NetworkingToml;
 use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_config::types::Notice;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -87,6 +88,7 @@ use codex_protocol::protocol::AskForApproval;
 use codex_protocol::protocol::SandboxPolicy;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_client::NetworkRuntimeConfig;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -1461,6 +1463,44 @@ fn resolve_web_search_config(
     }
 }
 
+fn resolve_networking_runtime_config(
+    networking: Option<&NetworkingToml>,
+) -> std::io::Result<NetworkRuntimeConfig> {
+    let Some(networking) = networking else {
+        return Ok(NetworkRuntimeConfig {
+            doh_servers: codex_client::default_doh_servers(),
+            request_log_path: None,
+        });
+    };
+
+    let doh_servers = networking
+        .doh_servers
+        .as_ref()
+        .map(|doh_servers| {
+            doh_servers
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(codex_client::default_doh_servers);
+    if doh_servers.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`networking.doh_servers` must contain at least one URL",
+        ));
+    }
+
+    Ok(NetworkRuntimeConfig {
+        doh_servers,
+        request_log_path: networking
+            .request_log_path
+            .as_ref()
+            .map(AbsolutePathBuf::to_path_buf),
+    })
+}
+
 fn resolve_multi_agent_v2_config(
     config_toml: &ConfigToml,
     config_profile: &ConfigProfile,
@@ -2068,6 +2108,14 @@ impl Config {
                 .clone()
                 .or(cfg.model_catalog_json.clone()),
         )?;
+        let networking_runtime_config =
+            resolve_networking_runtime_config(cfg.networking.as_ref())?;
+        codex_client::configure_networking(networking_runtime_config).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid networking config: {error}"),
+            )
+        })?;
 
         let log_dir = cfg
             .log_dir

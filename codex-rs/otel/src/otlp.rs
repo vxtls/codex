@@ -1,4 +1,6 @@
 use crate::config::OtelTlsConfig;
+use codex_client::apply_doh_resolver_blocking;
+use codex_client::build_reqwest_client_with_custom_ca;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Uri;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT;
@@ -102,8 +104,8 @@ fn build_http_client_inner(
     tls: &OtelTlsConfig,
     timeout_var: &str,
 ) -> Result<reqwest::blocking::Client, Box<dyn Error>> {
-    let mut builder =
-        reqwest::blocking::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
+    let builder = reqwest::blocking::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
+    let mut builder = apply_doh_resolver_blocking(builder).map_err(config_error)?;
 
     if let Some(path) = tls.ca_certificate.as_ref() {
         let (pem, location) = read_bytes(path)?;
@@ -188,9 +190,7 @@ pub(crate) fn build_async_http_client(
         }
     }
 
-    builder
-        .build()
-        .map_err(|error| Box::new(error) as Box<dyn Error>)
+    build_reqwest_client_with_custom_ca(builder).map_err(|error| Box::new(error) as Box<dyn Error>)
 }
 
 pub(crate) fn resolve_otlp_timeout(signal_var: &str) -> Duration {

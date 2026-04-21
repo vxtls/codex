@@ -17,6 +17,7 @@ use crate::state::validate_policy_against_constraints;
 use anyhow::Context;
 use anyhow::Result;
 use async_trait::async_trait;
+use codex_client::resolve_host_with_doh;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use globset::GlobSet;
 use serde::Serialize;
@@ -28,7 +29,6 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::net::lookup_host;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
@@ -715,9 +715,10 @@ async fn host_resolves_to_non_public_ip(host: &str, port: u16) -> bool {
         return is_non_public_ip(ip);
     }
 
-    // Block the request if this DNS lookup fails. We resolve the hostname again when we connect,
-    // so a failed check here does not prove the destination is public.
-    let addrs = match timeout(DNS_LOOKUP_TIMEOUT, lookup_host((host, port))).await {
+    // Use the same DoH path as the rest of Codex's outbound networking so local/private checks
+    // cannot be bypassed via the platform resolver. If the lookup fails, block the request: we
+    // resolve again when we connect, so a failure here does not prove the destination is public.
+    let addrs = match timeout(DNS_LOOKUP_TIMEOUT, resolve_host_with_doh(host, port)).await {
         Ok(Ok(addrs)) => addrs,
         Ok(Err(err)) => {
             debug!(

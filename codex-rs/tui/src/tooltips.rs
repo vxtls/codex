@@ -125,6 +125,7 @@ pub(crate) mod announcement {
     use crate::version::CODEX_CLI_VERSION;
     use chrono::NaiveDate;
     use chrono::Utc;
+    use codex_client::build_reqwest_client_with_custom_ca;
     use codex_protocol::account::PlanType;
     use regex_lite::Regex;
     use serde::Deserialize;
@@ -207,17 +208,21 @@ pub(crate) mod announcement {
     }
 
     fn blocking_init_announcement_tip() -> Option<String> {
-        // Avoid system proxy detection to prevent macOS system-configuration panics (#8912).
-        let client = reqwest::blocking::Client::builder()
-            .no_proxy()
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
             .build()
             .ok()?;
-        let response = client
-            .get(ANNOUNCEMENT_TIP_URL)
-            .timeout(Duration::from_millis(2000))
-            .send()
-            .ok()?;
-        response.error_for_status().ok()?.text().ok()
+        runtime.block_on(async {
+            let client = build_reqwest_client_with_custom_ca(reqwest::Client::builder().no_proxy())
+                .ok()?;
+            let response = client
+                .get(ANNOUNCEMENT_TIP_URL)
+                .timeout(Duration::from_millis(2000))
+                .send()
+                .await
+                .ok()?;
+            response.error_for_status().ok()?.text().await.ok()
+        })
     }
 
     pub(crate) fn parse_announcement_tip_toml(

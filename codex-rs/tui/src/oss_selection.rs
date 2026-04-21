@@ -1,6 +1,7 @@
 use std::io;
 use std::sync::LazyLock;
 
+use codex_client::build_reqwest_client_with_custom_ca;
 use crate::legacy_core::config::set_default_oss_provider;
 use codex_model_provider_info::DEFAULT_LMSTUDIO_PORT;
 use codex_model_provider_info::DEFAULT_OLLAMA_PORT;
@@ -359,10 +360,10 @@ async fn check_ollama_status() -> ProviderStatus {
 }
 
 async fn check_port_status(port: u16) -> io::Result<bool> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(io::Error::other)?;
+    let client = build_reqwest_client_with_custom_ca(
+        reqwest::Client::builder().timeout(Duration::from_secs(2)),
+    )
+    .map_err(io::Error::other)?;
 
     let url = format!("http://localhost:{port}");
 

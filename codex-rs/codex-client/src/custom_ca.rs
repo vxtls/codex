@@ -129,6 +129,10 @@ pub enum BuildCustomCaTransportError {
     #[error("Failed to build HTTP client while using system root certificates: {0}")]
     BuildClientWithSystemRoots(#[source] reqwest::Error),
 
+    /// Reqwest DoH resolver wiring failed before client construction.
+    #[error("Failed to configure DoH resolver for HTTP client: {detail}")]
+    ConfigureDohResolver { detail: String },
+
     /// One parsed certificate block could not be registered with the websocket TLS root store.
     #[error(
         "Failed to register certificate #{certificate_index} from {} selected by {} in rustls root store: {source}. {hint}",
@@ -156,7 +160,8 @@ impl From<BuildCustomCaTransportError> for io::Error {
                 io::Error::new(io::ErrorKind::InvalidData, error)
             }
             BuildCustomCaTransportError::BuildClientWithCustomCa { .. }
-            | BuildCustomCaTransportError::BuildClientWithSystemRoots(_) => io::Error::other(error),
+            | BuildCustomCaTransportError::BuildClientWithSystemRoots(_)
+            | BuildCustomCaTransportError::ConfigureDohResolver { .. } => io::Error::other(error),
         }
     }
 }
@@ -177,6 +182,19 @@ impl From<BuildCustomCaTransportError> for io::Error {
 /// Returns a [`BuildCustomCaTransportError`] when the configured CA file is unreadable,
 /// malformed, or contains a certificate block that `reqwest` cannot register as a root.
 pub fn build_reqwest_client_with_custom_ca(
+    builder: reqwest::ClientBuilder,
+) -> Result<reqwest::Client, BuildCustomCaTransportError> {
+    let builder = crate::networking::apply_doh_resolver(builder).map_err(|detail| {
+        BuildCustomCaTransportError::ConfigureDohResolver { detail }
+    })?;
+    build_reqwest_client_with_env(&ProcessEnv, builder)
+}
+
+/// Builds a reqwest client that honors custom CA environment variables without applying DoH.
+///
+/// This path is used internally for bootstrapping the DoH runtime itself so the DoH HTTP client
+/// can be created before the resolver is installed on other reqwest clients.
+pub fn build_reqwest_client_with_custom_ca_without_doh(
     builder: reqwest::ClientBuilder,
 ) -> Result<reqwest::Client, BuildCustomCaTransportError> {
     build_reqwest_client_with_env(&ProcessEnv, builder)
@@ -209,7 +227,7 @@ pub fn maybe_build_rustls_client_config_with_custom_ca()
 pub fn build_reqwest_client_for_subprocess_tests(
     builder: reqwest::ClientBuilder,
 ) -> Result<reqwest::Client, BuildCustomCaTransportError> {
-    build_reqwest_client_with_env(&ProcessEnv, builder.no_proxy())
+    build_reqwest_client_with_custom_ca_without_doh(builder.no_proxy())
 }
 
 fn maybe_build_rustls_client_config_with_env(

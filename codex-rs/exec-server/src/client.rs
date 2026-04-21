@@ -7,6 +7,8 @@ use std::sync::atomic::AtomicU64;
 use std::time::Duration;
 
 use arc_swap::ArcSwap;
+use codex_client::log_request_metadata;
+use codex_client::resolve_host_with_doh;
 use codex_app_server_protocol::JSONRPCNotification;
 use serde_json::Value;
 use tokio::sync::Mutex;
@@ -14,7 +16,8 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 
 use tokio::time::timeout;
-use tokio_tungstenite::connect_async;
+use tokio_tungstenite::client_async_tls_with_config;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tracing::debug;
 
 use crate::ProcessId;
@@ -206,16 +209,111 @@ impl ExecServerClient {
     ) -> Result<Self, ExecServerError> {
         let websocket_url = args.websocket_url.clone();
         let connect_timeout = args.connect_timeout;
-        let (stream, _) = timeout(connect_timeout, connect_async(websocket_url.as_str()))
-            .await
-            .map_err(|_| ExecServerError::WebSocketConnectTimeout {
-                url: websocket_url.clone(),
-                timeout: connect_timeout,
+        let connect_start = std::time::Instant::now();
+        let uri: tokio_tungstenite::tungstenite::http::Uri =
+            websocket_url.parse().map_err(|error| {
+                ExecServerError::Protocol(format!(
+                    "invalid exec-server websocket URL `{websocket_url}`: {error}"
+                ))
+            })?;
+        let host = uri.host().ok_or_else(|| {
+            ExecServerError::Protocol(format!("websocket URL `{websocket_url}` is missing host"))
+        })?;
+        let port = uri.port_u16().unwrap_or_else(|| match uri.scheme_str() {
+            Some("wss") => 443,
+            _ => 80,
+        });
+        let addrs = resolve_host_with_doh(host, port).await.map_err(|error| {
+            let message = format!("DoH resolution failed for `{websocket_url}`: {error}");
+            log_request_metadata(
+                "ws",
+                "GET",
+                websocket_url.as_str(),
+                None,
+                connect_start.elapsed(),
+                Some(message.as_str()),
+            );
+            ExecServerError::Protocol(message)
+        })?;
+        let mut tcp_stream = None;
+        let mut last_connect_error = None;
+        for addr in addrs {
+            match tokio::net::TcpStream::connect(addr).await {
+                Ok(stream) => {
+                    tcp_stream = Some(stream);
+                    break;
+                }
+                Err(error) => {
+                    last_connect_error = Some(error);
+                }
+            }
+        }
+        let Some(tcp_stream) = tcp_stream else {
+            let message = last_connect_error.map_or_else(
+                || format!("failed to connect to exec-server websocket `{websocket_url}`"),
+                |error| format!("failed to connect to exec-server websocket `{websocket_url}`: {error}"),
+            );
+            log_request_metadata(
+                "ws",
+                "GET",
+                websocket_url.as_str(),
+                None,
+                connect_start.elapsed(),
+                Some(message.as_str()),
+            );
+            return Err(ExecServerError::Protocol(message));
+        };
+        let request = websocket_url.as_str().into_client_request().map_err(|error| {
+            ExecServerError::Protocol(format!(
+                "invalid exec-server websocket request `{websocket_url}`: {error}"
+            ))
+        })?;
+        let (stream, response) = timeout(
+            connect_timeout,
+            client_async_tls_with_config(request, tcp_stream, None, None),
+        )
+        .await
+            .map_err(|_| {
+                let message = format!(
+                    "timed out connecting to exec-server websocket `{websocket_url}` after {connect_timeout:?}"
+                );
+                log_request_metadata(
+                    "ws",
+                    "GET",
+                    websocket_url.as_str(),
+                    None,
+                    connect_start.elapsed(),
+                    Some(message.as_str()),
+                );
+                ExecServerError::WebSocketConnectTimeout {
+                    url: websocket_url.clone(),
+                    timeout: connect_timeout,
+                }
             })?
             .map_err(|source| ExecServerError::WebSocketConnect {
                 url: websocket_url.clone(),
                 source,
+            })
+            .map_err(|error| {
+                let message = error.to_string();
+                log_request_metadata(
+                    "ws",
+                    "GET",
+                    websocket_url.as_str(),
+                    None,
+                    connect_start.elapsed(),
+                    Some(message.as_str()),
+                );
+                error
             })?;
+        log_request_metadata(
+            "ws",
+            "GET",
+            websocket_url.as_str(),
+            Some(response.status().as_u16()),
+            connect_start.elapsed(),
+            None,
+        );
 
         Self::connect(
             JsonRpcConnection::from_websocket(

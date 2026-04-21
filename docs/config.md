@@ -88,6 +88,47 @@ same bundle. If the file is empty, unreadable, or malformed, the affected Codex
 HTTP or secure websocket connection reports a user-facing error that points
 back to these environment variables.
 
+## Strict DoH Networking
+
+Codex requires strict DoH configuration for Codex-owned outbound networking
+(HTTP/HTTPS/SSE/WS/WSS and explicit DNS checks).
+
+Codex uses these strict DoH servers by default:
+
+```toml
+[networking]
+doh_servers = [
+  "https://1.1.1.1/dns-query",
+  "https://1.0.0.1/dns-query",
+  "https://8.8.8.8/resolve",
+]
+```
+
+Add a `[networking]` section in `~/.codex/config.toml` to override the defaults
+or enable request logging:
+
+```toml
+[networking]
+doh_servers = [
+  "https://1.1.1.1/dns-query",
+  "https://1.0.0.1/dns-query",
+  "https://8.8.8.8/resolve",
+]
+request_log_path = "/absolute/path/to/network-requests.jsonl"
+```
+
+Rules:
+
+- If `[networking]` is omitted, Codex falls back to the built-in DoH servers above.
+- If `networking.doh_servers` is set, it must be non-empty.
+- DoH server URLs must be valid `http`/`https` URLs.
+- DoH server hosts must be IP literals (for strict no-system-DNS bootstrap).
+- If configuration is invalid, config loading fails at startup.
+- There is no fallback to system DNS.
+- `request_log_path` is optional. When set, Codex appends JSONL metadata
+  records with: `ts`, `transport`, `method`, `url`, `status`,
+  `duration_ms`, `error`.
+
 ## Notices
 
 Codex stores "do not show again" flags for some UI prompts under the `[notice]` table.

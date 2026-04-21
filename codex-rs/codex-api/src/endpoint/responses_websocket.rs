@@ -9,7 +9,9 @@ use crate::sse::ResponsesStreamEvent;
 use crate::sse::process_responses_event;
 use crate::telemetry::WebsocketTelemetry;
 use codex_client::TransportError;
+use codex_client::log_request_metadata;
 use codex_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_client::resolve_host_with_doh;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
 use futures::StreamExt;
@@ -30,7 +32,7 @@ use tokio::sync::oneshot;
 use tokio::time::Instant;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::connect_async_tls_with_config;
+use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -350,6 +352,7 @@ async fn connect_websocket(
 ) -> Result<(WsStream, bool, Option<String>, Option<String>), ApiError> {
     ensure_rustls_crypto_provider();
     info!("connecting to websocket: {url}");
+    let start = Instant::now();
 
     let mut request = url
         .as_str()
@@ -364,13 +367,55 @@ async fn connect_websocket(
         .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
         .map(tokio_tungstenite::Connector::Rustls);
 
-    let response = connect_async_tls_with_config(
-        request,
-        Some(websocket_config()),
-        false, // `false` means "do not disable Nagle", which is tungstenite's recommended default.
-        connector,
-    )
-    .await;
+    let host = url
+        .host_str()
+        .ok_or_else(|| ApiError::Stream("websocket URL is missing host".to_string()))?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| ApiError::Stream(format!("websocket URL is missing port: {url}")))?;
+    let addrs = resolve_host_with_doh(host, port).await.map_err(|err| {
+        let message = format!("DoH resolution failed for {host}: {err}");
+        log_request_metadata(
+            "ws",
+            "GET",
+            url.as_str(),
+            None,
+            start.elapsed(),
+            Some(message.as_str()),
+        );
+        ApiError::Stream(message)
+    })?;
+    let mut stream = None;
+    let mut last_connect_error = None;
+    for addr in addrs {
+        match TcpStream::connect(addr).await {
+            Ok(value) => {
+                stream = Some(value);
+                break;
+            }
+            Err(error) => {
+                last_connect_error = Some(error);
+            }
+        }
+    }
+    let Some(stream) = stream else {
+        let message = last_connect_error.map_or_else(
+            || format!("failed to connect websocket TCP stream for {url}"),
+            |error| format!("failed to connect websocket TCP stream for {url}: {error}"),
+        );
+        log_request_metadata(
+            "ws",
+            "GET",
+            url.as_str(),
+            None,
+            start.elapsed(),
+            Some(message.as_str()),
+        );
+        return Err(ApiError::Stream(message));
+    };
+
+    let response =
+        client_async_tls_with_config(request, stream, Some(websocket_config()), connector).await;
 
     let (stream, response) = match response {
         Ok((stream, response)) => {
@@ -378,10 +423,27 @@ async fn connect_websocket(
                 "successfully connected to websocket: {url}, headers: {:?}",
                 response.headers()
             );
+            log_request_metadata(
+                "ws",
+                "GET",
+                url.as_str(),
+                Some(response.status().as_u16()),
+                start.elapsed(),
+                None,
+            );
             (stream, response)
         }
         Err(err) => {
             error!("failed to connect to websocket: {err}, url: {url}");
+            let message = err.to_string();
+            log_request_metadata(
+                "ws",
+                "GET",
+                url.as_str(),
+                None,
+                start.elapsed(),
+                Some(message.as_str()),
+            );
             return Err(map_ws_error(err, &url));
         }
     };

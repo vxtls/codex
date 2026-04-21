@@ -10,8 +10,10 @@ use reqwest::Response;
 use serde::Serialize;
 use std::fmt::Display;
 use std::time::Duration;
+use std::time::Instant;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
+use crate::networking::log_request_metadata;
 
 #[derive(Clone, Debug)]
 pub struct CodexHttpClient {
@@ -112,6 +114,7 @@ impl CodexRequestBuilder {
 
     pub async fn send(self) -> Result<Response, reqwest::Error> {
         let headers = trace_headers();
+        let start = Instant::now();
 
         match self.builder.headers(headers).send().await {
             Ok(response) => {
@@ -123,17 +126,34 @@ impl CodexRequestBuilder {
                     version = ?response.version(),
                     "Request completed"
                 );
+                log_request_metadata(
+                    "http",
+                    self.method.as_str(),
+                    self.url.as_str(),
+                    Some(response.status().as_u16()),
+                    start.elapsed(),
+                    None,
+                );
 
                 Ok(response)
             }
             Err(error) => {
                 let status = error.status();
+                let error_message = error.to_string();
                 tracing::debug!(
                     method = %self.method,
                     url = %self.url,
                     status = status.map(|s| s.as_u16()),
                     error = %error,
                     "Request failed"
+                );
+                log_request_metadata(
+                    "http",
+                    self.method.as_str(),
+                    self.url.as_str(),
+                    status.map(|s| s.as_u16()),
+                    start.elapsed(),
+                    Some(error_message.as_str()),
                 );
                 Err(error)
             }

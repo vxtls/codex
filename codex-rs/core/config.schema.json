@@ -1281,6 +1281,27 @@
       },
       "type": "object"
     },
+    "NetworkingToml": {
+      "additionalProperties": false,
+      "properties": {
+        "doh_servers": {
+          "description": "Ordered DoH server list used for all Codex-owned DNS resolution.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "request_log_path": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/AbsolutePathBuf"
+            }
+          ],
+          "description": "Optional JSONL file path for outbound request metadata logging."
+        }
+      },
+      "type": "object"
+    },
     "NotificationCondition": {
       "oneOf": [
         {
@@ -2740,6 +2761,15 @@
         }
       ],
       "description": "Optional verbosity control for GPT-5 models (Responses API `text.verbosity`)."
+    },
+    "networking": {
+      "allOf": [
+        {
+          "$ref": "#/definitions/NetworkingToml"
+        }
+      ],
+      "default": null,
+      "description": "Outbound networking policy for Codex-owned requests."
     },
     "notice": {
       "allOf": [

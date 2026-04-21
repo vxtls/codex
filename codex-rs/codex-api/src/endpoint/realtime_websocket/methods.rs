@@ -16,7 +16,9 @@ use crate::endpoint::realtime_websocket::protocol::parse_realtime_event;
 use crate::error::ApiError;
 use crate::provider::Provider;
 use codex_client::backoff;
+use codex_client::log_request_metadata;
 use codex_client::maybe_build_rustls_client_config_with_custom_ca;
+use codex_client::resolve_host_with_doh;
 use codex_protocol::protocol::RealtimeTranscriptDelta;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
@@ -34,6 +36,7 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
+use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -655,19 +658,83 @@ impl RealtimeWebsocketClient {
         request.headers_mut().extend(headers);
 
         info!("connecting realtime websocket: {ws_url}");
+        let connect_start = std::time::Instant::now();
         // Realtime websocket TLS should honor the same custom-CA env vars as the rest of Codex's
         // outbound HTTPS and websocket traffic.
         let connector = maybe_build_rustls_client_config_with_custom_ca()
             .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
             .map(tokio_tungstenite::Connector::Rustls);
-        let (stream, response) = tokio_tungstenite::connect_async_tls_with_config(
-            request,
-            Some(websocket_config()),
-            false,
-            connector,
-        )
-        .await
-        .map_err(|err| ApiError::Stream(format!("failed to connect realtime websocket: {err}")))?;
+        let host = ws_url
+            .host_str()
+            .ok_or_else(|| ApiError::Stream("realtime websocket URL is missing host".to_string()))?;
+        let port = ws_url.port_or_known_default().ok_or_else(|| {
+            ApiError::Stream(format!("realtime websocket URL is missing port: {ws_url}"))
+        })?;
+        let addrs = resolve_host_with_doh(host, port).await.map_err(|err| {
+            let message = format!("DoH resolution failed for realtime websocket {host}: {err}");
+            log_request_metadata(
+                "ws",
+                "GET",
+                ws_url.as_str(),
+                None,
+                connect_start.elapsed(),
+                Some(message.as_str()),
+            );
+            ApiError::Stream(message)
+        })?;
+        let mut stream = None;
+        let mut last_connect_error = None;
+        for addr in addrs {
+            match TcpStream::connect(addr).await {
+                Ok(value) => {
+                    stream = Some(value);
+                    break;
+                }
+                Err(error) => {
+                    last_connect_error = Some(error);
+                }
+            }
+        }
+        let Some(stream) = stream else {
+            let message = last_connect_error.map_or_else(
+                || format!("failed to connect realtime websocket TCP stream for {ws_url}"),
+                |error| {
+                    format!("failed to connect realtime websocket TCP stream for {ws_url}: {error}")
+                },
+            );
+            log_request_metadata(
+                "ws",
+                "GET",
+                ws_url.as_str(),
+                None,
+                connect_start.elapsed(),
+                Some(message.as_str()),
+            );
+            return Err(ApiError::Stream(message));
+        };
+        let (stream, response) =
+            client_async_tls_with_config(request, stream, Some(websocket_config()), connector)
+                .await
+                .map_err(|err| {
+                    let message = format!("failed to connect realtime websocket: {err}");
+                    log_request_metadata(
+                        "ws",
+                        "GET",
+                        ws_url.as_str(),
+                        None,
+                        connect_start.elapsed(),
+                        Some(message.as_str()),
+                    );
+                    ApiError::Stream(message)
+                })?;
+        log_request_metadata(
+            "ws",
+            "GET",
+            ws_url.as_str(),
+            Some(response.status().as_u16()),
+            connect_start.elapsed(),
+            None,
+        );
         info!(
             ws_url = %ws_url,
             status = %response.status(),

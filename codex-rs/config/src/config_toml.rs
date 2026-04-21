@@ -15,6 +15,7 @@ use crate::types::History;
 use crate::types::MarketplaceConfig;
 use crate::types::McpServerConfig;
 use crate::types::MemoriesToml;
+use crate::types::NetworkingToml;
 use crate::types::Notice;
 use crate::types::OAuthCredentialsStoreMode;
 use crate::types::OtelConfigToml;
@@ -275,6 +276,10 @@ pub struct ConfigToml {
 
     /// Base URL override for the built-in `openai` model provider.
     pub openai_base_url: Option<String>,
+
+    /// Outbound networking policy for Codex-owned requests.
+    #[serde(default)]
+    pub networking: Option<NetworkingToml>,
 
     /// Machine-local realtime audio device preferences used by realtime voice.
     #[serde(default)]

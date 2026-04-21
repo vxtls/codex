@@ -1,4 +1,5 @@
 use codex_core::config::Config;
+use codex_client::build_reqwest_client_with_custom_ca;
 use codex_model_provider_info::LMSTUDIO_OSS_PROVIDER_ID;
 use std::io;
 use std::path::Path;
@@ -29,10 +30,10 @@ impl LMStudioClient {
             )
         })?;
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_secs(5))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+        let client = build_reqwest_client_with_custom_ca(
+            reqwest::Client::builder().connect_timeout(std::time::Duration::from_secs(5)),
+        )
+        .map_err(io::Error::other)?;
 
         let client = LMStudioClient {
             client,
