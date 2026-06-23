@@ -19,6 +19,7 @@ use codex_client::backoff;
 use codex_client::log_request_metadata;
 use codex_client::maybe_build_rustls_client_config_with_custom_ca;
 use codex_client::resolve_host_with_doh;
+use codex_protocol::protocol::ConversationTextRole;
 use codex_protocol::protocol::RealtimeTranscriptDelta;
 use codex_utils_rustls_provider::ensure_rustls_crypto_provider;
 use futures::SinkExt;
@@ -36,7 +37,6 @@ use tokio::sync::oneshot;
 use tokio::time::sleep;
 use tokio_tungstenite::MaybeTlsStream;
 use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::client_async_tls_with_config;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -230,8 +230,12 @@ impl RealtimeWebsocketConnection {
         self.writer.send_audio_frame(frame).await
     }
 
-    pub async fn send_conversation_item_create(&self, text: String) -> Result<(), ApiError> {
-        self.writer.send_conversation_item_create(text).await
+    pub async fn send_conversation_item_create(
+        &self,
+        text: String,
+        role: ConversationTextRole,
+    ) -> Result<(), ApiError> {
+        self.writer.send_conversation_item_create(text, role).await
     }
 
     pub async fn send_conversation_function_call_output(
@@ -289,9 +293,29 @@ impl RealtimeWebsocketWriter {
             .await
     }
 
-    pub async fn send_conversation_item_create(&self, text: String) -> Result<(), ApiError> {
-        self.send_json(&conversation_item_create_message(self.event_parser, text))
-            .await
+    pub async fn send_conversation_item_create(
+        &self,
+        text: String,
+        role: ConversationTextRole,
+    ) -> Result<(), ApiError> {
+        self.send_json(&conversation_item_create_message(
+            self.event_parser,
+            text,
+            role,
+        ))
+        .await
+    }
+
+    pub async fn send_conversation_handoff_append(
+        &self,
+        handoff_id: String,
+        output_text: String,
+    ) -> Result<(), ApiError> {
+        self.send_json(&RealtimeOutboundMessage::ConversationHandoffAppend {
+            handoff_id,
+            output_text,
+        })
+        .await
     }
 
     pub async fn send_conversation_function_call_output(
@@ -659,14 +683,9 @@ impl RealtimeWebsocketClient {
 
         info!("connecting realtime websocket: {ws_url}");
         let connect_start = std::time::Instant::now();
-        // Realtime websocket TLS should honor the same custom-CA env vars as the rest of Codex's
-        // outbound HTTPS and websocket traffic.
-        let connector = maybe_build_rustls_client_config_with_custom_ca()
-            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
-            .map(tokio_tungstenite::Connector::Rustls);
-        let host = ws_url
-            .host_str()
-            .ok_or_else(|| ApiError::Stream("realtime websocket URL is missing host".to_string()))?;
+        let host = ws_url.host_str().ok_or_else(|| {
+            ApiError::Stream(format!("realtime websocket URL is missing host: {ws_url}"))
+        })?;
         let port = ws_url.port_or_known_default().ok_or_else(|| {
             ApiError::Stream(format!("realtime websocket URL is missing port: {ws_url}"))
         })?;
@@ -682,25 +701,23 @@ impl RealtimeWebsocketClient {
             );
             ApiError::Stream(message)
         })?;
-        let mut stream = None;
+        let mut tcp_stream = None;
         let mut last_connect_error = None;
         for addr in addrs {
             match TcpStream::connect(addr).await {
-                Ok(value) => {
-                    stream = Some(value);
+                Ok(stream) => {
+                    tcp_stream = Some(stream);
                     break;
                 }
-                Err(error) => {
-                    last_connect_error = Some(error);
+                Err(err) => {
+                    last_connect_error = Some(err);
                 }
             }
         }
-        let Some(stream) = stream else {
+        let Some(tcp_stream) = tcp_stream else {
             let message = last_connect_error.map_or_else(
-                || format!("failed to connect realtime websocket TCP stream for {ws_url}"),
-                |error| {
-                    format!("failed to connect realtime websocket TCP stream for {ws_url}: {error}")
-                },
+                || format!("failed to connect realtime websocket: {ws_url}"),
+                |err| format!("failed to connect realtime websocket: {err}"),
             );
             log_request_metadata(
                 "ws",
@@ -712,21 +729,30 @@ impl RealtimeWebsocketClient {
             );
             return Err(ApiError::Stream(message));
         };
-        let (stream, response) =
-            client_async_tls_with_config(request, stream, Some(websocket_config()), connector)
-                .await
-                .map_err(|err| {
-                    let message = format!("failed to connect realtime websocket: {err}");
-                    log_request_metadata(
-                        "ws",
-                        "GET",
-                        ws_url.as_str(),
-                        None,
-                        connect_start.elapsed(),
-                        Some(message.as_str()),
-                    );
-                    ApiError::Stream(message)
-                })?;
+        // Realtime websocket TLS should honor the same custom-CA env vars as the rest of Codex's
+        // outbound HTTPS and websocket traffic.
+        let connector = maybe_build_rustls_client_config_with_custom_ca()
+            .map_err(|err| ApiError::Stream(format!("failed to configure websocket TLS: {err}")))?
+            .map(tokio_tungstenite::Connector::Rustls);
+        let (stream, response) = tokio_tungstenite::client_async_tls_with_config(
+            request,
+            tcp_stream,
+            Some(websocket_config()),
+            connector,
+        )
+        .await
+        .map_err(|err| {
+            let message = format!("failed to connect realtime websocket: {err}");
+            log_request_metadata(
+                "ws",
+                "GET",
+                ws_url.as_str(),
+                None,
+                connect_start.elapsed(),
+                Some(message.as_str()),
+            );
+            ApiError::Stream(message)
+        })?;
         log_request_metadata(
             "ws",
             "GET",
@@ -925,7 +951,7 @@ mod tests {
         assert_eq!(
             parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
             Some(RealtimeEvent::SessionUpdated {
-                session_id: "sess_123".to_string(),
+                realtime_session_id: "sess_123".to_string(),
                 instructions: Some("backend prompt".to_string()),
             })
         );
@@ -1056,6 +1082,22 @@ mod tests {
             parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
             Some(RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
                 text: "hello world".to_string(),
+            }))
+        );
+    }
+
+    #[test]
+    fn parse_v1_input_transcript_turn_marked_event() {
+        let payload = json!({
+            "type": "conversation.input_transcript.turn_marked",
+            "transcript": "hello realtime"
+        })
+        .to_string();
+
+        assert_eq!(
+            parse_realtime_event(payload.as_str(), RealtimeEventParser::V1),
+            Some(RealtimeEvent::InputTranscriptDone(RealtimeTranscriptDone {
+                text: "hello realtime".to_string(),
             }))
         );
     }
@@ -1648,6 +1690,11 @@ mod tests {
                 .expect("text");
             let third_json: Value = serde_json::from_str(&third).expect("json");
             assert_eq!(third_json["type"], "conversation.item.create");
+            assert_eq!(third_json["item"]["role"], "developer");
+            assert_eq!(
+                third_json["item"]["content"][0]["type"],
+                Value::String("input_text".to_string())
+            );
             assert_eq!(third_json["item"]["content"][0]["text"], "hello agent");
 
             let fourth = ws
@@ -1658,10 +1705,29 @@ mod tests {
                 .into_text()
                 .expect("text");
             let fourth_json: Value = serde_json::from_str(&fourth).expect("json");
-            assert_eq!(fourth_json["type"], "conversation.handoff.append");
-            assert_eq!(fourth_json["handoff_id"], "handoff_1");
+            assert_eq!(fourth_json["type"], "conversation.item.create");
+            assert_eq!(fourth_json["item"]["role"], "assistant");
             assert_eq!(
-                fourth_json["output_text"],
+                fourth_json["item"]["content"][0]["type"],
+                Value::String("output_text".to_string())
+            );
+            assert_eq!(
+                fourth_json["item"]["content"][0]["text"],
+                Value::String("assistant context".to_string())
+            );
+
+            let fifth = ws
+                .next()
+                .await
+                .expect("fifth msg")
+                .expect("fifth msg ok")
+                .into_text()
+                .expect("text");
+            let fifth_json: Value = serde_json::from_str(&fifth).expect("json");
+            assert_eq!(fifth_json["type"], "conversation.handoff.append");
+            assert_eq!(fifth_json["handoff_id"], "handoff_1");
+            assert_eq!(
+                fifth_json["output_text"],
                 "\"Agent Final Message\":\n\nhello from background agent"
             );
 
@@ -1765,7 +1831,7 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_mock".to_string(),
+                realtime_session_id: "sess_mock".to_string(),
                 instructions: Some("backend prompt".to_string()),
             }
         );
@@ -1781,9 +1847,19 @@ mod tests {
             .await
             .expect("send audio");
         connection
-            .send_conversation_item_create("hello agent".to_string())
+            .send_conversation_item_create(
+                "hello agent".to_string(),
+                ConversationTextRole::Developer,
+            )
             .await
             .expect("send item");
+        connection
+            .send_conversation_item_create(
+                "assistant context".to_string(),
+                ConversationTextRole::Assistant,
+            )
+            .await
+            .expect("send assistant item");
         connection
             .send_conversation_function_call_output(
                 "handoff_1".to_string(),
@@ -1983,6 +2059,7 @@ mod tests {
                 .expect("text");
             let second_json: Value = serde_json::from_str(&second).expect("json");
             assert_eq!(second_json["type"], "conversation.item.create");
+            assert_eq!(second_json["item"]["role"], "developer");
             assert_eq!(
                 second_json["item"]["type"],
                 Value::String("message".to_string())
@@ -2005,16 +2082,35 @@ mod tests {
                 .expect("text");
             let third_json: Value = serde_json::from_str(&third).expect("json");
             assert_eq!(third_json["type"], "conversation.item.create");
+            assert_eq!(third_json["item"]["role"], "assistant");
             assert_eq!(
-                third_json["item"]["type"],
+                third_json["item"]["content"][0]["type"],
+                Value::String("output_text".to_string())
+            );
+            assert_eq!(
+                third_json["item"]["content"][0]["text"],
+                Value::String("assistant context".to_string())
+            );
+
+            let fourth = ws
+                .next()
+                .await
+                .expect("fourth msg")
+                .expect("fourth msg ok")
+                .into_text()
+                .expect("text");
+            let fourth_json: Value = serde_json::from_str(&fourth).expect("json");
+            assert_eq!(fourth_json["type"], "conversation.item.create");
+            assert_eq!(
+                fourth_json["item"]["type"],
                 Value::String("function_call_output".to_string())
             );
             assert_eq!(
-                third_json["item"]["call_id"],
+                fourth_json["item"]["call_id"],
                 Value::String("call_1".to_string())
             );
             assert_eq!(
-                third_json["item"]["output"],
+                fourth_json["item"]["output"],
                 Value::String("delegated result".to_string())
             );
         });
@@ -2059,15 +2155,25 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_v2".to_string(),
+                realtime_session_id: "sess_v2".to_string(),
                 instructions: Some("backend prompt".to_string()),
             }
         );
 
         connection
-            .send_conversation_item_create("delegate this".to_string())
+            .send_conversation_item_create(
+                "delegate this".to_string(),
+                ConversationTextRole::Developer,
+            )
             .await
             .expect("send text item");
+        connection
+            .send_conversation_item_create(
+                "assistant context".to_string(),
+                ConversationTextRole::Assistant,
+            )
+            .await
+            .expect("send assistant item");
         connection
             .send_conversation_function_call_output(
                 "call_1".to_string(),
@@ -2174,7 +2280,7 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_transcription".to_string(),
+                realtime_session_id: "sess_transcription".to_string(),
                 instructions: None,
             }
         );
@@ -2278,7 +2384,7 @@ mod tests {
         assert_eq!(
             created,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_v1_mode".to_string(),
+                realtime_session_id: "sess_v1_mode".to_string(),
                 instructions: None,
             }
         );
@@ -2384,7 +2490,7 @@ mod tests {
         assert_eq!(
             next_event,
             RealtimeEvent::SessionUpdated {
-                session_id: "sess_after_send".to_string(),
+                realtime_session_id: "sess_after_send".to_string(),
                 instructions: Some("backend prompt".to_string()),
             }
         );

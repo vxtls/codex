@@ -1,12 +1,13 @@
 use super::AgentRoleConfig;
-use crate::config_loader::ConfigLayerStack;
-use crate::config_loader::ConfigLayerStackOrdering;
+use codex_config::ConfigLayerStack;
+use codex_config::ConfigLayerStackOrdering;
 use codex_config::config_toml::AgentRoleToml;
 use codex_config::config_toml::AgentsToml;
 use codex_config::config_toml::ConfigToml;
 use codex_exec_server::ExecutorFileSystem;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::AbsolutePathBufGuard;
+use codex_utils_path_uri::PathUri;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -33,7 +34,8 @@ pub(crate) async fn load_agent_roles(
     for layer in layers {
         let mut layer_roles: BTreeMap<String, AgentRoleConfig> = BTreeMap::new();
         let mut declared_role_files = BTreeSet::new();
-        let agents_toml = match agents_toml_from_layer(&layer.config) {
+        let config_folder = layer.config_folder();
+        let agents_toml = match agents_toml_from_layer(&layer.config, config_folder.as_deref()) {
             Ok(agents_toml) => agents_toml,
             Err(err) => {
                 push_agent_role_warning(startup_warnings, err);
@@ -169,11 +171,16 @@ fn merge_missing_role_fields(role: &mut AgentRoleConfig, fallback: &AgentRoleCon
         .or(fallback.nickname_candidates.clone());
 }
 
-fn agents_toml_from_layer(layer_toml: &TomlValue) -> std::io::Result<Option<AgentsToml>> {
+fn agents_toml_from_layer(
+    layer_toml: &TomlValue,
+    config_base_dir: Option<&Path>,
+) -> std::io::Result<Option<AgentsToml>> {
     let Some(agents_toml) = layer_toml.get("agents") else {
         return Ok(None);
     };
 
+    // AbsolutePathBufGuard resolves relative paths while it remains in scope.
+    let _guard = config_base_dir.map(AbsolutePathBufGuard::new);
     agents_toml
         .clone()
         .try_into()
@@ -313,7 +320,8 @@ async fn read_resolved_agent_role_file(
     path: &AbsolutePathBuf,
     role_name_hint: Option<&str>,
 ) -> std::io::Result<ResolvedAgentRoleFile> {
-    let contents = fs.read_file_text(path, /*sandbox*/ None).await?;
+    let path_uri = PathUri::from_abs_path(path);
+    let contents = fs.read_file_text(&path_uri, /*sandbox*/ None).await?;
     let config_base_dir = path.parent().unwrap_or_else(|| path.clone());
     parse_agent_role_file_contents(
         &contents,
@@ -385,8 +393,9 @@ async fn validate_agent_role_config_file(
         return Ok(());
     };
 
+    let config_file_uri = PathUri::from_abs_path(config_file);
     let metadata = fs
-        .get_metadata(config_file, /*sandbox*/ None)
+        .get_metadata(&config_file_uri, /*sandbox*/ None)
         .await
         .map_err(|e| {
             std::io::Error::new(
@@ -516,7 +525,8 @@ async fn collect_agent_role_files(
     let mut files = Vec::new();
     let mut dirs = vec![dir.clone()];
     while let Some(dir) = dirs.pop() {
-        let entries = match fs.read_directory(&dir, /*sandbox*/ None).await {
+        let dir_uri = PathUri::from_abs_path(&dir);
+        let entries = match fs.read_directory(&dir_uri, /*sandbox*/ None).await {
             Ok(entries) => entries,
             Err(err) if err.kind() == ErrorKind::NotFound => continue,
             Err(err) => return Err(err),

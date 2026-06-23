@@ -4,16 +4,15 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use codex_rollout::ARCHIVED_SESSIONS_SUBDIR;
-use codex_rollout::RolloutConfig;
 use uuid::Uuid;
 
-pub(super) fn test_config(codex_home: &Path) -> RolloutConfig {
-    RolloutConfig {
+use super::LocalThreadStoreConfig;
+
+pub(super) fn test_config(codex_home: &Path) -> LocalThreadStoreConfig {
+    LocalThreadStoreConfig {
         codex_home: codex_home.to_path_buf(),
         sqlite_home: codex_home.to_path_buf(),
-        cwd: codex_home.to_path_buf(),
-        model_provider_id: "test-provider".to_string(),
-        generate_memories: true,
+        default_model_provider_id: "test-provider".to_string(),
     }
 }
 
@@ -78,6 +77,7 @@ pub(super) fn write_session_file_with_fork(
         "timestamp": ts,
         "type": "session_meta",
         "payload": {
+            "session_id": uuid,
             "id": uuid,
             "forked_from_id": forked_from_id,
             "timestamp": ts,

@@ -5,14 +5,13 @@ name = "codex-client"
 version.workspace = true
 
 [dependencies]
-async-trait = { workspace = true }
 bytes = { workspace = true }
 eventsource-stream = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
 opentelemetry = { workspace = true }
 rand = { workspace = true }
-reqwest = { workspace = true, features = ["blocking", "json", "stream"] }
+reqwest = { workspace = true, features = ["blocking", "json", "rustls-tls-native-roots", "stream"] }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }
 rustls-pki-types = { workspace = true }
@@ -25,6 +24,18 @@ tracing-opentelemetry = { workspace = true }
 codex-utils-rustls-provider = { workspace = true }
 zstd = { workspace = true }
 
+[target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
+sha2 = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+system-configuration = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinHttp",
+] }
+
 [lints]
 workspace = true
 
@@ -32,5 +43,9 @@ workspace = true
 codex-utils-cargo-bin = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 pretty_assertions = { workspace = true }
+rcgen = { workspace = true }
 tempfile = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+[lib]
+doctest = false

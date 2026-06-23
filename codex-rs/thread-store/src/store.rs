@@ -1,67 +1,131 @@
+use codex_protocol::ThreadId;
 use std::any::Any;
-
-use async_trait::async_trait;
+use std::future::Future;
+use std::pin::Pin;
 
 use crate::AppendThreadItemsParams;
 use crate::ArchiveThreadParams;
 use crate::CreateThreadParams;
+use crate::DeleteThreadParams;
+use crate::ItemPage;
+use crate::ListItemsParams;
 use crate::ListThreadsParams;
+use crate::ListTurnsParams;
 use crate::LoadThreadHistoryParams;
+use crate::ReadThreadByRolloutPathParams;
 use crate::ReadThreadParams;
-use crate::ResumeThreadRecorderParams;
+use crate::ResumeThreadParams;
+use crate::SearchThreadsParams;
 use crate::StoredThread;
 use crate::StoredThreadHistory;
 use crate::ThreadPage;
-use crate::ThreadRecorder;
+use crate::ThreadSearchPage;
+use crate::ThreadStoreError;
 use crate::ThreadStoreResult;
+use crate::TurnPage;
 use crate::UpdateThreadMetadataParams;
 
+/// Future returned by [`ThreadStore`] operations.
+pub type ThreadStoreFuture<'a, T> = Pin<Box<dyn Future<Output = ThreadStoreResult<T>> + Send + 'a>>;
+
 /// Storage-neutral thread persistence boundary.
-#[async_trait]
 pub trait ThreadStore: Any + Send + Sync {
-    /// Return this store as [`Any`] so callers at API boundaries can reject requests that only
-    /// make sense for a concrete store implementation.
+    /// Return this store as [`Any`] for implementation-owned escape hatches.
     fn as_any(&self) -> &dyn Any;
 
-    /// Creates a new thread and returns a live recorder for future appends.
-    async fn create_thread(
-        &self,
-        params: CreateThreadParams,
-    ) -> ThreadStoreResult<Box<dyn ThreadRecorder>>;
+    /// Creates a new live thread.
+    fn create_thread(&self, params: CreateThreadParams) -> ThreadStoreFuture<'_, ()>;
 
-    /// Reopens a live recorder for an existing thread.
-    async fn resume_thread_recorder(
-        &self,
-        params: ResumeThreadRecorderParams,
-    ) -> ThreadStoreResult<Box<dyn ThreadRecorder>>;
+    /// Reopens an existing thread for live appends.
+    fn resume_thread(&self, params: ResumeThreadParams) -> ThreadStoreFuture<'_, ()>;
 
-    /// Appends items to a stored thread outside the live-recorder path.
-    async fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreResult<()>;
+    /// Appends raw rollout items to a live thread.
+    ///
+    /// Implementations should apply the shared rollout persistence policy before writing durable
+    /// replay history and before updating any implementation-owned projections.
+    fn append_items(&self, params: AppendThreadItemsParams) -> ThreadStoreFuture<'_, ()>;
+
+    /// Materializes the thread if persistence is lazy, then persists all queued items.
+    fn persist_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
+
+    /// Flushes all queued items and returns once they are durable/readable.
+    fn flush_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
+
+    /// Flushes pending items and closes the live thread writer.
+    fn shutdown_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
+
+    /// Discards the live thread writer without forcing pending in-memory items to become durable.
+    ///
+    /// Core calls this when session initialization fails after a live writer has been created.
+    /// Implementations should release any live writer resources for the thread while preserving
+    /// already-durable thread data.
+    fn discard_thread(&self, thread_id: ThreadId) -> ThreadStoreFuture<'_, ()>;
 
     /// Loads persisted history for resume, fork, rollback, and memory jobs.
-    async fn load_history(
+    fn load_history(
         &self,
         params: LoadThreadHistoryParams,
-    ) -> ThreadStoreResult<StoredThreadHistory>;
+    ) -> ThreadStoreFuture<'_, StoredThreadHistory>;
 
     /// Reads a thread summary and optionally its persisted history.
-    async fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreResult<StoredThread>;
+    fn read_thread(&self, params: ReadThreadParams) -> ThreadStoreFuture<'_, StoredThread>;
+
+    /// Reads a rollout-backed thread by path when the store supports path-addressed lookups.
+    ///
+    /// Deprecated: new callers should use [`ThreadStore::read_thread`] instead.
+    fn read_thread_by_rollout_path(
+        &self,
+        params: ReadThreadByRolloutPathParams,
+    ) -> ThreadStoreFuture<'_, StoredThread>;
 
     /// Lists stored threads matching the supplied filters.
-    async fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreResult<ThreadPage>;
+    fn list_threads(&self, params: ListThreadsParams) -> ThreadStoreFuture<'_, ThreadPage>;
 
-    /// Applies a mutable metadata patch and returns the updated thread.
-    async fn update_thread_metadata(
+    /// Searches stored threads and returns search-only preview metadata.
+    fn search_threads(
+        &self,
+        _params: SearchThreadsParams,
+    ) -> ThreadStoreFuture<'_, ThreadSearchPage> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "thread/search",
+            })
+        })
+    }
+
+    /// Lists turns within a stored thread.
+    fn list_turns(&self, _params: ListTurnsParams) -> ThreadStoreFuture<'_, TurnPage> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "list_turns",
+            })
+        })
+    }
+
+    /// Lists persisted items within a stored thread, optionally filtered to a turn.
+    fn list_items(&self, _params: ListItemsParams) -> ThreadStoreFuture<'_, ItemPage> {
+        Box::pin(async {
+            Err(ThreadStoreError::Unsupported {
+                operation: "list_items",
+            })
+        })
+    }
+
+    /// Applies a literal metadata patch and returns the updated thread.
+    ///
+    /// Implementations should apply the supplied fields directly. Policy such as deciding whether
+    /// an append-derived preview should be emitted belongs above the store.
+    fn update_thread_metadata(
         &self,
         params: UpdateThreadMetadataParams,
-    ) -> ThreadStoreResult<StoredThread>;
+    ) -> ThreadStoreFuture<'_, StoredThread>;
 
     /// Archives a thread.
-    async fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreResult<()>;
+    fn archive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, ()>;
 
     /// Unarchives a thread and returns its updated metadata.
-    async fn unarchive_thread(
-        &self,
-        params: ArchiveThreadParams,
-    ) -> ThreadStoreResult<StoredThread>;
+    fn unarchive_thread(&self, params: ArchiveThreadParams) -> ThreadStoreFuture<'_, StoredThread>;
+
+    /// Deletes a thread's persisted rollout data and associated metadata.
+    fn delete_thread(&self, params: DeleteThreadParams) -> ThreadStoreFuture<'_, ()>;
 }

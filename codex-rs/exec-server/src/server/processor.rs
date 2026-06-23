@@ -47,8 +47,13 @@ async fn run_connection(
     runtime_paths: ExecServerRuntimePaths,
 ) {
     let router = Arc::new(build_router());
-    let (json_outgoing_tx, mut incoming_rx, mut disconnected_rx, connection_tasks) =
-        connection.into_parts();
+    let JsonRpcConnection {
+        outgoing_tx: json_outgoing_tx,
+        mut incoming_rx,
+        mut disconnected_rx,
+        task_handles: connection_tasks,
+        transport: _transport,
+    } = connection;
     let (outgoing_tx, mut outgoing_rx) =
         mpsc::channel::<RpcServerOutboundMessage>(CHANNEL_CAPACITY);
     let notifications = RpcNotificationSender::new(outgoing_tx.clone());
@@ -103,7 +108,9 @@ async fn run_connection(
                                 break;
                             }
                         };
-                        if outgoing_tx.send(message).await.is_err() {
+                        if let Some(message) = message
+                            && outgoing_tx.send(message).await.is_err()
+                        {
                             break;
                         }
                     } else if outgoing_tx
@@ -188,6 +195,8 @@ mod tests {
     use codex_app_server_protocol::JSONRPCRequest;
     use codex_app_server_protocol::JSONRPCResponse;
     use codex_app_server_protocol::RequestId;
+    use codex_utils_path_uri::PathUri;
+    use pretty_assertions::assert_eq;
     use serde::Serialize;
     use serde::de::DeserializeOwned;
     use tokio::io::AsyncBufReadExt;
@@ -203,9 +212,11 @@ mod tests {
     use crate::ExecServerRuntimePaths;
     use crate::ProcessId;
     use crate::connection::JsonRpcConnection;
+    use crate::protocol::ENVIRONMENT_INFO_METHOD;
     use crate::protocol::EXEC_METHOD;
     use crate::protocol::EXEC_READ_METHOD;
     use crate::protocol::EXEC_TERMINATE_METHOD;
+    use crate::protocol::EnvironmentInfo;
     use crate::protocol::ExecParams;
     use crate::protocol::ExecResponse;
     use crate::protocol::INITIALIZE_METHOD;
@@ -216,6 +227,38 @@ mod tests {
     use crate::protocol::TerminateParams;
     use crate::protocol::TerminateResponse;
     use crate::server::session_registry::SessionRegistry;
+
+    #[tokio::test]
+    async fn connection_accepts_pipelined_scalar_requests() {
+        let registry = SessionRegistry::new();
+        let (mut writer, mut lines, task) = spawn_test_connection(registry, "pipelined-scalar");
+
+        send_request(
+            &mut writer,
+            /*id*/ 1,
+            INITIALIZE_METHOD,
+            &InitializeParams {
+                client_name: "exec-server-test".to_string(),
+                resume_session_id: None,
+            },
+        )
+        .await;
+        let _: InitializeResponse = read_response(&mut lines, /*expected_id*/ 1).await;
+        send_notification(&mut writer, INITIALIZED_METHOD, &()).await;
+
+        send_request(&mut writer, /*id*/ 2, ENVIRONMENT_INFO_METHOD, &()).await;
+        send_request(&mut writer, /*id*/ 3, ENVIRONMENT_INFO_METHOD, &()).await;
+
+        let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 2).await;
+        let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 3).await;
+
+        drop(writer);
+        drop(lines);
+        timeout(Duration::from_secs(1), task)
+            .await
+            .expect("processor should exit")
+            .expect("processor should join");
+    }
 
     #[tokio::test]
     async fn transport_disconnect_detaches_session_during_in_flight_read() {
@@ -389,12 +432,15 @@ mod tests {
         ExecParams {
             process_id,
             argv: sleep_then_print_argv(),
-            cwd: std::env::current_dir().expect("cwd"),
+            cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+                .expect("cwd URI"),
             env_policy: None,
             env,
             tty: false,
             pipe_stdin: false,
             arg0: None,
+            sandbox: None,
+            enforce_managed_network: false,
         }
     }
 

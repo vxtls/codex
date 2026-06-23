@@ -5,11 +5,11 @@ use chrono::Utc;
 use codex_exec_server::LOCAL_FS;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_protocol::models::ResponseItem;
+use codex_protocol::models::plaintext_agent_message_content;
 use codex_thread_store::ListThreadsParams;
 use codex_thread_store::SortDirection;
 use codex_thread_store::StoredThread;
 use codex_thread_store::ThreadSortKey;
-use codex_thread_store::ThreadStore;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_output_truncation::TruncationPolicy;
 use codex_utils_output_truncation::truncate_text;
@@ -136,8 +136,11 @@ async fn load_recent_threads(sess: &Session) -> Vec<StoredThread> {
             sort_direction: SortDirection::Desc,
             allowed_sources: Vec::new(),
             model_providers: None,
+            cwd_filters: None,
+            parent_thread_id: None,
             archived: false,
             search_term: None,
+            use_state_db_only: false,
         })
         .await
     {
@@ -236,6 +239,17 @@ fn build_current_thread_section(items: &[ResponseItem]) -> Option<String> {
                     continue;
                 }
                 current_assistant.push(text);
+            }
+            ResponseItem::AgentMessage {
+                author, content, ..
+            } => {
+                let Some(text) = plaintext_agent_message_content(content) else {
+                    continue;
+                };
+                if current_user.is_empty() && current_assistant.is_empty() {
+                    continue;
+                }
+                current_assistant.push(format!("Agent message from {author}:\n{text}"));
             }
             _ => {}
         }

@@ -77,6 +77,7 @@ const LIGHT_256_GUTTER_FG_IDX: u8 = 236;
 
 use crate::color::is_light;
 use crate::color::perceptual_distance;
+use crate::diff_model::FileChange;
 use crate::exec_command::relativize_to_home;
 use crate::render::Insets;
 use crate::render::highlight::DiffScopeBackgroundRgbs;
@@ -94,7 +95,6 @@ use crate::terminal_palette::indexed_color;
 use crate::terminal_palette::rgb_color;
 use crate::terminal_palette::stdout_color_level;
 use codex_git_utils::get_git_repo_root;
-use codex_protocol::protocol::FileChange;
 use codex_terminal_detection::TerminalName;
 use codex_terminal_detection::terminal_info;
 
@@ -299,7 +299,7 @@ pub struct DiffSummary {
 }
 
 impl DiffSummary {
-    pub fn new(changes: HashMap<PathBuf, FileChange>, cwd: AbsolutePathBuf) -> Self {
+    pub(crate) fn new(changes: HashMap<PathBuf, FileChange>, cwd: AbsolutePathBuf) -> Self {
         Self { changes, cwd }
     }
 }
@@ -1307,6 +1307,7 @@ fn style_gutter_dim() -> Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use insta::assert_debug_snapshot;
     use insta::assert_snapshot;
     use pretty_assertions::assert_eq;
     use ratatui::Terminal;
@@ -2198,6 +2199,58 @@ mod tests {
             has_rgb,
             "add diff for .rs file should produce syntax-highlighted (RGB) spans"
         );
+    }
+
+    #[test]
+    fn cpp_module_extensions_use_cpp_highlighting() {
+        let highlighted_tokens = ["cpp", "cppm", "CPPM", "cxxm", "CxXm", "ixx", "IXX"]
+            .into_iter()
+            .map(|extension| {
+                let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+                changes.insert(
+                    PathBuf::from(format!("math.{extension}")),
+                    FileChange::Add {
+                        content:
+                            "export module math;\nexport int sum(int a, int b) { return a + b; }\n"
+                                .to_string(),
+                    },
+                );
+
+                let lines =
+                    create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+                let rgb_tokens = lines
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .filter(|span| matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
+                    .map(|span| span.content.to_string())
+                    .collect::<Vec<_>>();
+                assert!(
+                    !rgb_tokens.is_empty(),
+                    "add diff for .{extension} file should produce syntax-highlighted (RGB) spans"
+                );
+                (extension, rgb_tokens.join("|"))
+            })
+            .collect::<Vec<_>>();
+
+        assert_debug_snapshot!("cpp_module_extension_highlighting", highlighted_tokens);
+    }
+
+    #[test]
+    fn unknown_extension_falls_back_without_syntax_highlighting() {
+        let mut changes: HashMap<PathBuf, FileChange> = HashMap::new();
+        changes.insert(
+            PathBuf::from("math.unknown-extension"),
+            FileChange::Add {
+                content: "export module math;\nexport int value = 42;\n".to_string(),
+            },
+        );
+
+        let lines = create_diff_summary(&changes, &PathBuf::from("/"), /*wrap_cols*/ 80);
+        assert!(lines.iter().all(|line| {
+            line.spans
+                .iter()
+                .all(|span| !matches!(span.style.fg, Some(ratatui::style::Color::Rgb(..))))
+        }));
     }
 
     #[test]

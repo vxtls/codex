@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use codex_utils_path_uri::PathUri;
 use pretty_assertions::assert_eq;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -26,12 +27,15 @@ fn exec_params_with_argv(process_id: &str, argv: Vec<String>) -> ExecParams {
     ExecParams {
         process_id: ProcessId::from(process_id),
         argv,
-        cwd: std::env::current_dir().expect("cwd"),
+        cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
+            .expect("cwd URI"),
         env_policy: None,
         env: inherited_path_env(),
         tty: false,
         pipe_stdin: false,
         arg0: None,
+        sandbox: None,
+        enforce_managed_network: false,
     }
 }
 
@@ -170,13 +174,12 @@ async fn long_poll_read_fails_after_session_resume() {
         .expect("initialize");
     first_handler.initialized().expect("initialized");
 
+    // Keep the process quiet and alive so the pending read can only complete
+    // after session resume, not because the process produced output or exited.
     first_handler
         .exec(exec_params_with_argv(
             "proc-long-poll",
-            shell_argv(
-                "sleep 0.1; printf resumed",
-                "ping -n 2 127.0.0.1 >NUL && echo resumed",
-            ),
+            shell_argv("sleep 5", "ping -n 6 127.0.0.1 >NUL"),
         ))
         .await
         .expect("start process");
@@ -257,7 +260,7 @@ async fn active_session_resume_is_rejected() {
         .await
         .expect_err("active session resume should fail");
 
-    assert_eq!(err.code, -32600);
+    assert_eq!(err.code, crate::rpc::SESSION_ALREADY_ATTACHED_ERROR_CODE);
     assert_eq!(
         err.message,
         format!(
@@ -292,8 +295,7 @@ async fn output_and_exit_are_retained_after_notification_receiver_closes() {
             process_id.as_str(),
             shell_argv(
                 "sleep 0.05; printf 'first\\n'; sleep 0.05; printf 'second\\n'",
-                // `cmd.exe` retains the space before `&&` in `echo first && ...`.
-                "(echo first) && ping -n 2 127.0.0.1 >NUL && (echo second)",
+                "echo first&& ping -n 2 127.0.0.1 >NUL&& echo second",
             ),
         ))
         .await
@@ -318,7 +320,7 @@ async fn read_process_until_closed(
     handler: &ExecServerHandler,
     process_id: ProcessId,
 ) -> (String, Option<i32>) {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let mut output = String::new();
     let mut exit_code = None;
     let mut after_seq = None;
@@ -347,7 +349,7 @@ async fn read_process_until_closed(
         after_seq = response.next_seq.checked_sub(1).or(after_seq);
         assert!(
             tokio::time::Instant::now() < deadline,
-            "process should close within 2s"
+            "process should close within 5s"
         );
     }
 }

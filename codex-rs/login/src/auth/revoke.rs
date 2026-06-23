@@ -10,13 +10,14 @@ use std::time::Duration;
 use codex_app_server_protocol::AuthMode as ApiAuthMode;
 use codex_client::CodexHttpClient;
 
-use super::manager::CLIENT_ID;
 use super::manager::REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR;
 use super::manager::REVOKE_TOKEN_URL;
 use super::manager::REVOKE_TOKEN_URL_OVERRIDE_ENV_VAR;
+use super::manager::oauth_client_id;
 use super::storage::AuthDotJson;
 use super::util::try_parse_error_message;
-use crate::default_client::create_client;
+use crate::default_client::create_default_auth_client;
+use crate::outbound_proxy::AuthRouteConfig;
 use crate::token_data::TokenData;
 
 const REVOKE_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -35,10 +36,10 @@ impl RevokeTokenKind {
         }
     }
 
-    fn client_id(self) -> Option<&'static str> {
+    fn client_id(self) -> Option<String> {
         match self {
             Self::Access => None,
-            Self::Refresh => Some(CLIENT_ID),
+            Self::Refresh => Some(oauth_client_id()),
         }
     }
 }
@@ -48,38 +49,30 @@ struct RevokeTokenRequest<'a> {
     token: &'a str,
     token_type_hint: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    client_id: Option<&'static str>,
+    client_id: Option<String>,
 }
 
 pub(super) async fn revoke_auth_tokens(
     auth_dot_json: Option<&AuthDotJson>,
+    auth_route_config: Option<&AuthRouteConfig>,
 ) -> Result<(), std::io::Error> {
-    let Some(tokens) = auth_dot_json.and_then(managed_chatgpt_tokens) else {
+    let Some((token, kind)) = auth_dot_json.and_then(revocable_token) else {
         return Ok(());
     };
 
-    let client = create_client();
     let endpoint = revoke_token_endpoint();
+    let client = create_default_auth_client(&endpoint, auth_route_config)?;
+    revoke_oauth_token(&client, endpoint.as_str(), token, kind, REVOKE_HTTP_TIMEOUT).await
+}
+
+fn revocable_token(auth_dot_json: &AuthDotJson) -> Option<(&str, RevokeTokenKind)> {
+    let tokens = managed_chatgpt_tokens(auth_dot_json)?;
     if !tokens.refresh_token.is_empty() {
-        revoke_oauth_token(
-            &client,
-            endpoint.as_str(),
-            tokens.refresh_token.as_str(),
-            RevokeTokenKind::Refresh,
-            REVOKE_HTTP_TIMEOUT,
-        )
-        .await
+        Some((tokens.refresh_token.as_str(), RevokeTokenKind::Refresh))
     } else if !tokens.access_token.is_empty() {
-        revoke_oauth_token(
-            &client,
-            endpoint.as_str(),
-            tokens.access_token.as_str(),
-            RevokeTokenKind::Access,
-            REVOKE_HTTP_TIMEOUT,
-        )
-        .await
+        Some((tokens.access_token.as_str(), RevokeTokenKind::Access))
     } else {
-        Ok(())
+        None
     }
 }
 
