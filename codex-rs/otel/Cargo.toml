@@ -49,6 +49,7 @@ opentelemetry_sdk = { workspace = true, features = [
     "trace",
 ] }
 http = { workspace = true }
+hyper-util = { version = "0.1.20", features = ["tokio"] }
 os_info = { workspace = true }
 reqwest = { workspace = true, features = ["blocking", "rustls-tls"] }
 serde = { workspace = true, features = ["derive"] }

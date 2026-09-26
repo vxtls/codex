@@ -9,6 +9,7 @@ use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_redacted_string::RedactedString;
+use hyper_util::rt::TokioIo;
 use tokio::net::TcpStream;
 use tonic::codegen::http::Uri;
 use tonic::transport::Endpoint;
@@ -74,7 +75,8 @@ impl RemoteThreadConfigLoader {
                     )
                 })?;
                 let addresses = resolve_host_with_doh(host, port).await?;
-                TcpStream::connect(addresses.as_slice()).await
+                let stream = TcpStream::connect(addresses.as_slice()).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
             }))
             .await
             .map_err(|err| {

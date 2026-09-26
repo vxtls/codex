@@ -1,6 +1,7 @@
 use crate::config::OtelTlsConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Uri;
+use hyper_util::rt::TokioIo;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT;
 use reqwest::Certificate as ReqwestCertificate;
@@ -94,7 +95,8 @@ pub(crate) fn build_grpc_channel(
             io::Error::new(ErrorKind::InvalidInput, "OTLP endpoint has no known port")
         })?;
         let addresses = codex_http_client::resolve_host_with_doh(host, port).await?;
-        TcpStream::connect(addresses.as_slice()).await
+        let stream = TcpStream::connect(addresses.as_slice()).await?;
+        Ok::<_, io::Error>(TokioIo::new(stream))
     }));
     Ok((channel, timeout))
 }
