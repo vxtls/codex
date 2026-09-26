@@ -103,7 +103,7 @@ pub fn run_main(args: Args) -> Result<()> {
     let client_builder = Client::builder().timeout(None::<Duration>);
     let client = Arc::new(
         codex_http_client::apply_doh_resolver_blocking(client_builder)
-            .context("configuring DoH resolver")?
+            .map_err(|detail| anyhow!("configuring DoH resolver: {detail}"))?
             .build()
             .context("building reqwest client")?,
     );
