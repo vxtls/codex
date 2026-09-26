@@ -9,9 +9,7 @@ use codex_protocol::permissions::FileSystemSandboxPolicy;
 use codex_protocol::permissions::FileSystemSpecialPath;
 use codex_protocol::permissions::NetworkSandboxPolicy;
 use codex_protocol::permissions::project_roots_glob_pattern;
-use codex_protocol::protocol::AskForApproval;
-use codex_protocol::protocol::SandboxPolicy;
-use codex_protocol::protocol::TurnContextItem;
+use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_absolute_path::test_support::PathBufExt;
 use core_test_support::test_path_buf;
 use pretty_assertions::assert_eq;
@@ -36,7 +34,9 @@ fn environment(id: &str, cwd: PathUri, shell: impl Into<String>) -> (String, Env
         EnvironmentState {
             cwd,
             status: EnvironmentStatus::Available,
+            error: None,
             shell: Some(shell.into()),
+            is_primary: false,
         },
     )
 }
@@ -48,8 +48,17 @@ fn environment_state(
     network: Option<NetworkContext>,
     subagents: Option<String>,
 ) -> EnvironmentsState {
+    let environments = environments
+        .into_iter()
+        .enumerate()
+        .map(|(index, (id, mut environment))| {
+            environment.is_primary = index == 0;
+            (id, environment)
+        })
+        .collect();
     EnvironmentsState {
-        environments: environments.into_iter().collect(),
+        environments,
+        shell_version: None,
         current_date,
         timezone,
         network,
@@ -88,7 +97,7 @@ fn serialize_workspace_write_environment_context() {
 
 #[test]
 fn serialize_environment_context_with_foreign_windows_cwd() {
-    let context = environment_state(
+    let mut context = environment_state(
         [environment(
             "remote",
             PathUri::parse("file:///C:/windows").expect("Windows cwd URI"),
@@ -99,12 +108,17 @@ fn serialize_environment_context_with_foreign_windows_cwd() {
         /*network*/ None,
         /*subagents*/ None,
     );
+    context.filesystem = Some(FileSystemContext::from_permission_profile(
+        &PermissionProfile::Disabled,
+        &[PathUri::parse("file:///D:/workspace").expect("Windows workspace root URI")],
+    ));
 
     assert_eq!(
         context.render(),
         r#"<environment_context>
   <cwd>C:\windows</cwd>
   <shell>powershell</shell>
+  <filesystem><workspace_roots><root>D:\workspace</root></workspace_roots><permission_profile type="disabled"><file_system type="unrestricted" /></permission_profile></filesystem>
 </environment_context>"#
     );
 }
@@ -149,18 +163,21 @@ fn workspace_write_permission_profile_with_private_denials() -> PermissionProfil
                     value: FileSystemSpecialPath::project_roots(/*subpath*/ None),
                 },
                 access: FileSystemAccessMode::Write,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::Special {
-                    value: FileSystemSpecialPath::project_roots(Some(PathBuf::from("private"))),
+                    value: FileSystemSpecialPath::project_roots(Some("private".to_string())),
                 },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             },
             FileSystemSandboxEntry {
                 path: FileSystemPath::GlobPattern {
                     pattern: project_roots_glob_pattern(Path::new("private/**")),
                 },
                 access: FileSystemAccessMode::Deny,
+                missing_path_behavior: None,
             },
         ]),
         NetworkSandboxPolicy::Restricted,
@@ -190,7 +207,10 @@ fn serialize_environment_context_with_full_filesystem_profile() {
     );
     context.filesystem = Some(FileSystemContext::from_permission_profile(
         &workspace_write_permission_profile_with_private_denials(),
-        &[repo.clone(), other_repo.clone()],
+        &[
+            PathUri::from_abs_path(&repo),
+            PathUri::from_abs_path(&other_repo),
+        ],
     ));
 
     let expected = format!(
@@ -209,58 +229,6 @@ fn serialize_environment_context_with_full_filesystem_profile() {
     );
 
     assert_eq!(context.render(), expected);
-}
-
-#[test]
-fn turn_context_item_filesystem_uses_workspace_roots_instead_of_cwd() {
-    let repo = test_abs_path("/repo");
-    let other_repo = test_abs_path("/other-repo");
-    let repo_private = repo.join("private");
-    let item = TurnContextItem {
-        turn_id: None,
-        cwd: test_abs_path("/not-the-workspace"),
-        workspace_roots: Some(vec![repo.clone(), other_repo.clone()]),
-        current_date: None,
-        timezone: None,
-        approval_policy: AskForApproval::Never,
-        sandbox_policy: SandboxPolicy::new_read_only_policy(),
-        permission_profile: Some(workspace_write_permission_profile_with_private_denials()),
-        network: None,
-        file_system_sandbox_policy: None,
-        model: "gpt-5".to_string(),
-        comp_hash: None,
-        personality: None,
-        collaboration_mode: None,
-        multi_agent_version: None,
-        multi_agent_mode: None,
-        realtime_active: None,
-        effort: None,
-        summary: codex_protocol::config_types::ReasoningSummary::Auto,
-    };
-
-    let context = EnvironmentsState::from_turn_context_item(&item).render();
-
-    assert!(
-        context.contains(&format!(
-            "<root>{}</root><root>{}</root>",
-            repo.to_string_lossy(),
-            other_repo.to_string_lossy()
-        )),
-        "{context}"
-    );
-    assert!(
-        context.contains(&format!("<path>{}</path>", repo_private.to_string_lossy())),
-        "{context}"
-    );
-    assert!(
-        !context.contains(
-            test_abs_path("/not-the-workspace")
-                .join("private")
-                .to_string_lossy()
-                .as_ref()
-        ),
-        "{context}"
-    );
 }
 
 #[test]
@@ -330,11 +298,11 @@ fn serialize_environment_context_with_multiple_selected_environments() {
     let expected = format!(
         r#"<environment_context>
   <environments>
-    <environment id="local">
+    <environment id="local" primary="true">
       <cwd>{}</cwd>
       <shell>bash</shell>
     </environment>
-    <environment id="remote">
+    <environment id="remote" primary="false">
       <cwd>{}</cwd>
       <shell>bash</shell>
     </environment>
@@ -371,11 +339,11 @@ fn serialize_environment_context_prefers_environment_shell_when_present() {
     let expected = format!(
         r#"<environment_context>
   <environments>
-    <environment id="local">
+    <environment id="local" primary="true">
       <cwd>{}</cwd>
       <shell>powershell</shell>
     </environment>
-    <environment id="remote">
+    <environment id="remote" primary="false">
       <cwd>{}</cwd>
       <shell>cmd</shell>
     </environment>
@@ -386,4 +354,73 @@ fn serialize_environment_context_prefers_environment_shell_when_present() {
     );
 
     assert_eq!(context.render(), expected);
+}
+
+fn powershell_environment() -> EnvironmentsState {
+    let cwd = PathUri::from_abs_path(&test_abs_path("/repo"));
+    EnvironmentsState {
+        environments: [environment("local", cwd, "powershell")].into(),
+        shell_version: Some("5.1".to_string()),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn shell_version_diff_restates_shell_from_legacy_snapshot() {
+    let current = powershell_environment();
+    let mut previous = current.snapshot();
+    previous.shell_version = None;
+    previous.environments.get_mut("local").expect("local").shell = None;
+    let rendered = current
+        .render_diff(PreviousSectionState::Known(&previous))
+        .expect("shell version update")
+        .render();
+    assert!(
+        rendered.contains("<shell>powershell</shell>\n  <shell_version>5.1</shell_version>"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn shell_version_diff_clears_previously_visible_version() {
+    let previous = powershell_environment();
+    let current = EnvironmentsState {
+        shell_version: None,
+        ..previous.clone()
+    };
+    assert_eq!(
+        current
+            .render_diff(PreviousSectionState::Known(&previous.snapshot()))
+            .expect("removed shell version")
+            .render(),
+        "<environment_context>\n  <shell_version status=\"unavailable\" />\n</environment_context>"
+    );
+}
+
+#[test]
+fn current_date_diff_clears_once_and_recovers() {
+    let available = EnvironmentsState {
+        current_date: Some("2026-06-17".to_string()),
+        ..Default::default()
+    };
+    let unavailable = EnvironmentsState::default();
+    assert_eq!(
+        unavailable
+            .render_diff(PreviousSectionState::Known(&available.snapshot()))
+            .expect("removed current date")
+            .render(),
+        "<environment_context>\n  <current_date status=\"unavailable\" />\n</environment_context>"
+    );
+    assert!(
+        unavailable
+            .render_diff(PreviousSectionState::Known(&unavailable.snapshot()))
+            .is_none()
+    );
+    assert_eq!(
+        available
+            .render_diff(PreviousSectionState::Known(&unavailable.snapshot()))
+            .expect("restored current date")
+            .render(),
+        "<environment_context>\n  <current_date>2026-06-17</current_date>\n</environment_context>"
+    );
 }

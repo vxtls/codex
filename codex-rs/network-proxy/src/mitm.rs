@@ -1,4 +1,5 @@
 use crate::certs::ManagedMitmCa;
+use crate::config::NetworkMitmCaConfig;
 use crate::config::NetworkMode;
 use crate::mitm_hook::HookEvaluation;
 use crate::mitm_hook::MitmHookActions;
@@ -38,10 +39,11 @@ use rama_http::Uri;
 use rama_http::header::HOST;
 use rama_http::layer::remove_header::RemoveRequestHeaderLayer;
 use rama_http::layer::remove_header::RemoveResponseHeaderLayer;
+use rama_http::uri::Scheme;
 use rama_http_backend::server::HttpServer;
-use rama_http_backend::server::layer::upgrade::Upgraded;
 use rama_net::proxy::ProxyTarget;
 use rama_net::stream::SocketInfo;
+use rama_tls_rustls::dep::rustls;
 use rama_tls_rustls::server::TlsAcceptorData;
 use rama_tls_rustls::server::TlsAcceptorLayer;
 use std::pin::Pin;
@@ -53,21 +55,23 @@ use tracing::warn;
 
 /// State needed to terminate a CONNECT tunnel and enforce policy on inner HTTPS requests.
 pub struct MitmState {
-    ca: ManagedMitmCa,
-    upstream: UpstreamClient,
+    ca: Arc<ManagedMitmCa>,
+    allow_upstream_proxy: bool,
+    upstream_tls_root_store: Arc<rustls::RootCertStore>,
     inspect: bool,
     max_body_bytes: usize,
 }
 
 pub(crate) struct MitmUpstreamConfig {
     pub(crate) allow_upstream_proxy: bool,
-    pub(crate) allow_local_binding: bool,
+    pub(crate) external_ca: Option<NetworkMitmCaConfig>,
 }
 
 #[derive(Clone)]
 struct MitmPolicyContext {
     target_host: String,
     target_port: u16,
+    scheme: Scheme,
     mode: NetworkMode,
     app_state: Arc<NetworkProxyState>,
 }
@@ -76,6 +80,7 @@ struct MitmPolicyContext {
 struct MitmRequestContext {
     policy: MitmPolicyContext,
     mitm: Arc<MitmState>,
+    upstream: UpstreamClient,
 }
 
 enum MitmPolicyDecision {
@@ -87,7 +92,6 @@ enum MitmPolicyDecision {
 
 const MITM_INSPECT_BODIES: bool = false;
 const MITM_MAX_BODY_BYTES: usize = 4096;
-
 impl std::fmt::Debug for MitmState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // Avoid dumping internal state (CA material, connectors, etc.) to logs.
@@ -104,27 +108,21 @@ impl MitmState {
 
         // MITM exists when HTTPS policy depends on the inner request: limited-mode method clamps
         // and host-specific hooks both need visibility after CONNECT is established. We
-        // generate/load a local CA and issue per-host leaf certs so we can terminate TLS and
+        // generate a process-local CA and issue per-host leaf certs so we can terminate TLS and
         // apply policy.
-        let ca = ManagedMitmCa::load_or_create()?;
-        let upstream_tls_root_store =
-            crate::certs::upstream_tls_root_store(&crate::certs::ca_env_from_process())?;
-
-        let upstream = if config.allow_upstream_proxy {
-            UpstreamClient::from_env_proxy_with_allow_local_binding(
-                config.allow_local_binding,
-                upstream_tls_root_store,
-            )
-        } else {
-            UpstreamClient::direct_with_allow_local_binding(
-                config.allow_local_binding,
-                upstream_tls_root_store,
-            )
+        let ca = match config.external_ca.as_ref() {
+            Some(ca) => ManagedMitmCa::load_from_files(ca)?,
+            None => ManagedMitmCa::load_or_create()?,
         };
+        let upstream_tls_root_store = crate::certs::upstream_tls_root_store_for_cert_path(
+            ca.certificate_path(),
+            &crate::certs::ca_env_from_process(),
+        )?;
 
         Ok(Self {
             ca,
-            upstream,
+            allow_upstream_proxy: config.allow_upstream_proxy,
+            upstream_tls_root_store,
             inspect: MITM_INSPECT_BODIES,
             max_body_bytes: MITM_MAX_BODY_BYTES,
         })
@@ -143,13 +141,8 @@ impl MitmState {
     }
 }
 
-/// Terminate the upgraded CONNECT stream with a generated leaf cert and proxy inner HTTPS traffic.
-pub(crate) async fn mitm_tunnel(upgraded: Upgraded) -> Result<()> {
-    mitm_stream(upgraded).await
-}
-
-/// Terminate a raw client stream with a generated leaf cert and proxy inner HTTPS traffic.
-pub(crate) async fn mitm_stream<S>(stream: S) -> Result<()>
+/// Proxy inner HTTP traffic, terminating TLS with a generated leaf certificate for HTTPS.
+pub(crate) async fn mitm_stream<S>(stream: S, scheme: Scheme) -> Result<()>
 where
     S: Stream + Unpin + ExtensionsMut,
 {
@@ -171,20 +164,37 @@ where
         .clone();
     let target_host = normalize_host(&target.host.to_string());
     let target_port = target.port;
-    let acceptor_data = mitm.tls_acceptor_data_for_host(&target_host)?;
+    let acceptor_data = if scheme == Scheme::HTTPS {
+        Some(mitm.tls_acceptor_data_for_host(&target_host)?)
+    } else {
+        None
+    };
     let mode = stream
         .extensions()
         .get::<NetworkMode>()
         .copied()
         .unwrap_or(NetworkMode::Full);
+    let upstream = if mitm.allow_upstream_proxy {
+        UpstreamClient::from_env_proxy_with_tls_root_store(
+            app_state.clone(),
+            mitm.upstream_tls_root_store.clone(),
+        )
+    } else {
+        UpstreamClient::direct_with_tls_root_store(
+            app_state.clone(),
+            mitm.upstream_tls_root_store.clone(),
+        )
+    };
     let request_ctx = Arc::new(MitmRequestContext {
         policy: MitmPolicyContext {
             target_host,
             target_port,
+            scheme,
             mode,
             app_state,
         },
         mitm,
+        upstream,
     });
 
     let executor = stream
@@ -195,8 +205,9 @@ where
 
     let http_service = HttpServer::auto(executor).service(
         (
-            RemoveResponseHeaderLayer::hop_by_hop(),
-            RemoveRequestHeaderLayer::hop_by_hop(),
+            (request_ctx.policy.scheme == Scheme::HTTPS)
+                .then(RemoveResponseHeaderLayer::hop_by_hop),
+            (request_ctx.policy.scheme == Scheme::HTTPS).then(RemoveRequestHeaderLayer::hop_by_hop),
         )
             .into_layer(service_fn({
                 let request_ctx = request_ctx.clone();
@@ -207,14 +218,17 @@ where
             })),
     );
 
-    let https_service = TlsAcceptorLayer::new(acceptor_data)
-        .with_store_client_hello(true)
-        .into_layer(http_service);
-
-    https_service
-        .serve(stream)
-        .await
-        .map_err(|err| anyhow!("MITM serve error: {err}"))?;
+    match acceptor_data {
+        Some(acceptor_data) => {
+            TlsAcceptorLayer::new(acceptor_data)
+                .with_store_client_hello(true)
+                .into_layer(http_service)
+                .serve(stream)
+                .await
+        }
+        None => http_service.serve(stream).await,
+    }
+    .map_err(|err| anyhow!("MITM serve error: {err}"))?;
     Ok(())
 }
 
@@ -247,9 +261,23 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     let log_path = path_for_log(req.uri());
 
     let (mut parts, body) = req.into_parts();
+    let authority = authority_header_value(&target_host, target_port, &request_ctx.policy.scheme);
+    parts.uri = Uri::builder()
+        .scheme(request_ctx.policy.scheme.clone())
+        .authority(authority.as_str())
+        .path_and_query(path.as_str())
+        .build()?;
+    // Server-wide OPTIONS must not borrow authority from a narrower credential URL prefix.
+    let credential_path = if path == "*" { "/" } else { &path };
+    let credential_destination = format!(
+        "{}://{authority}{credential_path}",
+        request_ctx.policy.scheme
+    );
+    request_ctx
+        .policy
+        .app_state
+        .inject_request_credentials(&credential_destination, &mut parts.headers);
     apply_mitm_hook_actions(&mut parts.headers, hook_actions.as_ref());
-    let authority = authority_header_value(&target_host, target_port);
-    parts.uri = build_https_uri(&authority, &path)?;
     parts
         .headers
         .insert(HOST, HeaderValue::from_str(&authority)?);
@@ -271,7 +299,11 @@ async fn forward_request(req: Request, request_ctx: &MitmRequestContext) -> Resu
     };
 
     let upstream_req = Request::from_parts(parts, body);
-    let upstream_resp = mitm.upstream.serve(upstream_req).await?;
+    let upstream_resp = if request_ctx.policy.scheme == Scheme::HTTP {
+        crate::brokered_tunnel::forward_http_request(upstream_req, &request_ctx.upstream).await?
+    } else {
+        request_ctx.upstream.serve(upstream_req).await?
+    };
     respond_with_inspection(
         upstream_resp,
         inspect,
@@ -297,6 +329,34 @@ async fn evaluate_mitm_policy(
     req: &Request,
     policy: &MitmPolicyContext,
 ) -> Result<MitmPolicyDecision> {
+    if policy.scheme == Scheme::HTTP {
+        let matches_target = |authority: &rama_http::uri::Authority| {
+            !authority.as_str().contains('@')
+                && normalize_host(authority.host()) == policy.target_host
+                && authority.port_u16().unwrap_or(80) == policy.target_port
+        };
+        let invalid_destination = req
+            .uri()
+            .scheme()
+            .is_some_and(|scheme| scheme != &Scheme::HTTP)
+            || req
+                .uri()
+                .authority()
+                .is_some_and(|authority| !matches_target(authority))
+            || req.headers().get_all(HOST).iter().any(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .and_then(|value| value.parse::<rama_http::uri::Authority>().ok())
+                    .is_none_or(|authority| !matches_target(&authority))
+            });
+        if invalid_destination {
+            return Ok(MitmPolicyDecision::Block(text_response(
+                StatusCode::BAD_REQUEST,
+                "tunnel destination mismatch",
+            )));
+        }
+    }
     if req.method().as_str() == "CONNECT" {
         return Ok(MitmPolicyDecision::Block(text_response(
             StatusCode::METHOD_NOT_ALLOWED,
@@ -343,7 +403,7 @@ async fn evaluate_mitm_policy(
                 client: client.clone(),
                 method: Some(method.clone()),
                 mode: Some(policy.mode),
-                protocol: "https".to_string(),
+                protocol: policy.scheme.to_string(),
                 decision: None,
                 source: None,
                 port: Some(policy.target_port),
@@ -371,7 +431,7 @@ async fn evaluate_mitm_policy(
                     client: client.clone(),
                     method: Some(method.clone()),
                     mode: Some(policy.mode),
-                    protocol: "https".to_string(),
+                    protocol: policy.scheme.to_string(),
                     decision: None,
                     source: None,
                     port: Some(policy.target_port),
@@ -388,7 +448,10 @@ async fn evaluate_mitm_policy(
         HookEvaluation::NoHooksForHost => None,
     };
 
-    if !policy.mode.allows_method(&method) {
+    let opaque_http_upgrade = policy.scheme == Scheme::HTTP
+        && policy.mode == NetworkMode::Limited
+        && req.headers().contains_key(rama_http::header::UPGRADE);
+    if !policy.mode.allows_method(&method) || opaque_http_upgrade {
         let _ = policy
             .app_state
             .record_blocked(BlockedRequest::new(BlockedRequestArgs {
@@ -397,7 +460,7 @@ async fn evaluate_mitm_policy(
                 client: client.clone(),
                 method: Some(method.clone()),
                 mode: Some(policy.mode),
-                protocol: "https".to_string(),
+                protocol: policy.scheme.to_string(),
                 decision: None,
                 source: None,
                 port: Some(policy.target_port),
@@ -544,24 +607,20 @@ fn extract_request_host(req: &Request) -> Option<String> {
         .or_else(|| req.uri().authority().map(|a| a.as_str().to_string()))
 }
 
-fn authority_header_value(host: &str, port: u16) -> String {
+fn authority_header_value(host: &str, port: u16, scheme: &Scheme) -> String {
     // Host header / URI authority formatting.
+    let default_port = if scheme == &Scheme::HTTP { 80 } else { 443 };
     if host.contains(':') {
-        if port == 443 {
+        if port == default_port {
             format!("[{host}]")
         } else {
             format!("[{host}]:{port}")
         }
-    } else if port == 443 {
+    } else if port == default_port {
         host.to_string()
     } else {
         format!("{host}:{port}")
     }
-}
-
-fn build_https_uri(authority: &str, path: &str) -> Result<Uri> {
-    let target = format!("https://{authority}{path}");
-    Ok(target.parse()?)
 }
 
 fn path_and_query(uri: &Uri) -> String {

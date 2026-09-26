@@ -19,12 +19,12 @@ use crate::slash_command::SlashCommand;
 use codex_protocol::user_input::ByteRange;
 use codex_protocol::user_input::TextElement;
 
-use super::super::footer::esc_hint_mode;
 use super::super::footer::reset_mode_after_activity;
 use super::ActivePopup;
 use super::ChatComposer;
 use super::InputResult;
 use super::QueuedInputAction;
+use super::parent_owned_command_is_allowed;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum SlashValidation {
@@ -177,7 +177,8 @@ impl<'a> SlashInput<'a> {
                 token_activity_command_enabled: self.command_flags.token_activity_command_enabled,
                 service_tier_commands_enabled: self.command_flags.service_tier_commands_enabled,
                 goal_command_enabled: self.command_flags.goal_command_enabled,
-                personality_command_enabled: self.command_flags.personality_command_enabled,
+                voice_command_enabled: self.command_flags.voice_command_enabled,
+                worktrees_enabled: self.command_flags.worktrees_enabled,
                 windows_degraded_sandbox_active: self.command_flags.allow_elevate_sandbox,
                 side_conversation_active: self.command_flags.side_conversation_active,
             },
@@ -187,7 +188,7 @@ impl<'a> SlashInput<'a> {
         command_popup
     }
 
-    fn command(&self, name: &str) -> Option<SlashCommandItem> {
+    pub(super) fn command(&self, name: &str) -> Option<SlashCommandItem> {
         find_slash_command(name, self.command_flags, self.service_tier_commands)
     }
 }
@@ -206,23 +207,42 @@ pub(super) fn queued_input_action(
 }
 
 impl ChatComposer {
+    pub(super) fn builtin_command_flags(&self) -> BuiltinCommandFlags {
+        BuiltinCommandFlags {
+            collaboration_modes_enabled: self.collaboration_modes_enabled,
+            connectors_enabled: self.connectors_enabled,
+            plugins_command_enabled: self.plugins_command_enabled,
+            token_activity_command_enabled: self.token_activity_command_enabled,
+            service_tier_commands_enabled: self.service_tier_commands_enabled,
+            goal_command_enabled: self.goal_command_enabled,
+            voice_command_enabled: self.voice_command_enabled,
+            worktrees_enabled: self.worktrees_enabled,
+            allow_elevate_sandbox: self.windows_degraded_sandbox_active,
+            side_conversation_active: self.side_conversation_active,
+        }
+    }
+
+    pub fn set_worktrees_enabled(&mut self, enabled: bool) {
+        self.worktrees_enabled = enabled;
+    }
+
     /// Handle key event when the slash-command popup is visible.
     pub(super) fn handle_key_event_with_slash_popup(
         &mut self,
         key_event: KeyEvent,
     ) -> (InputResult, bool) {
-        if self.handle_shortcut_overlay_key(&key_event) {
+        if self.handle_empty_prompt_shortcut(&key_event) {
             return (InputResult::None, true);
         }
         if key_event.code == KeyCode::Esc {
-            let next_mode = esc_hint_mode(self.footer.mode, self.is_task_running);
-            if next_mode != self.footer.mode {
-                self.footer.mode = next_mode;
-                return (InputResult::None, true);
-            }
-        } else {
-            self.footer.mode = reset_mode_after_activity(self.footer.mode);
+            // Always dismiss the popup without changing the draft.
+            let first_line = self.draft.textarea.text().lines().next().unwrap_or("");
+            self.popups.dismissed_command_token =
+                command_popup_filter_text(first_line, /*cursor*/ 0);
+            self.popups.active = ActivePopup::None;
+            return (InputResult::None, true);
         }
+        self.footer.mode = reset_mode_after_activity(self.footer.mode);
         let ActivePopup::Command(popup) = &mut self.popups.active else {
             unreachable!();
         };
@@ -249,13 +269,6 @@ impl ChatComposer {
                 ..
             } => {
                 popup.move_down();
-                (InputResult::None, true)
-            }
-            KeyEvent {
-                code: KeyCode::Esc, ..
-            } => {
-                // Dismiss the slash popup; keep the current input untouched.
-                self.popups.active = ActivePopup::None;
                 (InputResult::None, true)
             }
             KeyEvent {
@@ -350,6 +363,19 @@ impl ChatComposer {
                 ..
             } => {
                 if let Some(sel) = popup.selected_item() {
+                    if self.blocks_direct_input {
+                        let command_is_allowed = match &sel {
+                            CommandItem::Builtin(cmd) => {
+                                parse_slash_name(self.draft.textarea.text()).is_some_and(
+                                    |(_, args, _)| parent_owned_command_is_allowed(*cmd, args),
+                                )
+                            }
+                            CommandItem::ServiceTier(_) => false,
+                        };
+                        if !command_is_allowed {
+                            return (InputResult::ParentOwnedInputBlocked, true);
+                        }
+                    }
                     if self
                         .complete_selected_slash_command_preserving_existing_draft_tail_as_inline_args(
                             &sel,
@@ -360,8 +386,11 @@ impl ChatComposer {
                     }
 
                     self.stage_selected_slash_command_history(&sel);
-                    self.draft.textarea.set_text_clearing_elements("");
-                    self.draft.is_bash_mode = false;
+                    if !matches!(sel, CommandItem::Builtin(cmd) if cmd.requires_dispatch_validation())
+                    {
+                        self.draft.textarea.set_text_clearing_elements("");
+                        self.draft.is_bash_mode = false;
+                    }
                     return (
                         match sel {
                             CommandItem::Builtin(cmd) => InputResult::Command(cmd),
@@ -605,6 +634,17 @@ mod tests {
     }
 
     #[test]
+    fn esc_dismisses_slash_popup_while_idle() {
+        let mut composer = composer_with_text_at_cursor("/rev", "/rev".len());
+        assert!(composer.popup_active());
+
+        assert_eq!(press(&mut composer, KeyCode::Esc), InputResult::None);
+
+        assert!(!composer.popup_active());
+        assert_eq!(composer.draft.textarea.text(), "/rev");
+    }
+
+    #[test]
     fn slash_completion_preserves_existing_draft_tail_for_inline_arg_commands() {
         let draft = "view the diff";
         let expected_text = "/review view the diff";
@@ -645,6 +685,6 @@ mod tests {
             press(&mut composer, KeyCode::Enter),
             InputResult::Command(SlashCommand::Review)
         );
-        assert!(composer.draft.textarea.is_empty());
+        assert_eq!(composer.draft.textarea.text(), "/review ");
     }
 }

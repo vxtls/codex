@@ -1,12 +1,12 @@
 use crate::config::OtelTlsConfig;
-use codex_client::apply_doh_resolver_blocking;
-use codex_client::build_reqwest_client_with_custom_ca;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Uri;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT;
 use opentelemetry_otlp::tonic_types::transport::Certificate as TonicCertificate;
+use opentelemetry_otlp::tonic_types::transport::Channel;
 use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
+use opentelemetry_otlp::tonic_types::transport::Endpoint;
 use opentelemetry_otlp::tonic_types::transport::Identity as TonicIdentity;
 use reqwest::Certificate as ReqwestCertificate;
 use reqwest::Identity as ReqwestIdentity;
@@ -20,6 +20,8 @@ use std::io;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::net::TcpStream;
+use tower::service_fn;
 
 pub(crate) fn build_header_map(headers: &std::collections::HashMap<String, String>) -> HeaderMap {
     let mut header_map = HeaderMap::new();
@@ -69,6 +71,34 @@ pub(crate) fn build_grpc_tls_config(
     Ok(config)
 }
 
+pub(crate) fn build_grpc_channel(
+    endpoint: &str,
+    tls_config: ClientTlsConfig,
+    timeout_var: &str,
+) -> Result<(Channel, Duration), Box<dyn Error>> {
+    let timeout = resolve_otlp_timeout(timeout_var);
+    let endpoint = Endpoint::from_shared(endpoint.to_string())?
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .tls_config(tls_config)?;
+    let channel = endpoint.connect_with_connector_lazy(service_fn(|uri: Uri| async move {
+        let host = uri
+            .host()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "OTLP endpoint has no host"))?;
+        let port = uri.port_u16().or_else(|| match uri.scheme_str() {
+            Some("http") => Some(80),
+            Some("https") => Some(443),
+            _ => None,
+        });
+        let port = port.ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "OTLP endpoint has no known port")
+        })?;
+        let addresses = codex_http_client::resolve_host_with_doh(host, port).await?;
+        TcpStream::connect(addresses.as_slice()).await
+    }));
+    Ok((channel, timeout))
+}
+
 /// Build a blocking HTTP client with TLS configuration for OTLP HTTP exporters.
 ///
 /// We use `reqwest::blocking::Client` because OTEL exporters run on dedicated
@@ -104,8 +134,8 @@ fn build_http_client_inner(
     tls: &OtelTlsConfig,
     timeout_var: &str,
 ) -> Result<reqwest::blocking::Client, Box<dyn Error>> {
-    let builder = reqwest::blocking::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
-    let mut builder = apply_doh_resolver_blocking(builder).map_err(config_error)?;
+    let mut builder =
+        reqwest::blocking::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
 
     if let Some(path) = tls.ca_certificate.as_ref() {
         let (pem, location) = read_bytes(path)?;
@@ -142,29 +172,30 @@ fn build_http_client_inner(
         (None, None) => {}
     }
 
-    builder
+    codex_http_client::apply_doh_resolver_blocking(builder)
+        .map_err(config_error)?
         .build()
         .map_err(|error| Box::new(error) as Box<dyn Error>)
 }
 
 pub(crate) fn build_async_http_client(
+    factory: &codex_http_client::HttpClientFactory,
     tls: Option<&OtelTlsConfig>,
     timeout_var: &str,
-) -> Result<reqwest::Client, Box<dyn Error>> {
-    let mut builder = reqwest::Client::builder().timeout(resolve_otlp_timeout(timeout_var));
+) -> Result<crate::network_policy::RuntimeHttpClient, Box<dyn Error>> {
+    let mut config = codex_http_client::HttpClientTlsConfig::default();
 
     if let Some(tls) = tls {
         if let Some(path) = tls.ca_certificate.as_ref() {
             let (pem, location) = read_bytes(path)?;
-            let certificate = ReqwestCertificate::from_pem(pem.as_slice()).map_err(|error| {
-                config_error(format!(
-                    "failed to parse certificate {}: {error}",
-                    location.display()
-                ))
-            })?;
-            builder = builder
-                .tls_built_in_root_certs(false)
-                .add_root_certificate(certificate);
+            config = config
+                .with_root_certificate_pem(pem.as_slice())
+                .map_err(|error| {
+                    config_error(format!(
+                        "failed to parse certificate {}: {error}",
+                        location.display()
+                    ))
+                })?;
         }
 
         match (&tls.client_certificate, &tls.client_private_key) {
@@ -172,14 +203,15 @@ pub(crate) fn build_async_http_client(
                 let (mut cert_pem, cert_location) = read_bytes(cert_path)?;
                 let (key_pem, key_location) = read_bytes(key_path)?;
                 cert_pem.extend_from_slice(key_pem.as_slice());
-                let identity = ReqwestIdentity::from_pem(cert_pem.as_slice()).map_err(|error| {
-                    config_error(format!(
-                        "failed to parse client identity using {} and {}: {error}",
-                        cert_location.display(),
-                        key_location.display()
-                    ))
-                })?;
-                builder = builder.identity(identity).https_only(true);
+                config = config
+                    .with_client_identity_pem(cert_pem.as_slice())
+                    .map_err(|error| {
+                        config_error(format!(
+                            "failed to parse client identity using {} and {}: {error}",
+                            cert_location.display(),
+                            key_location.display()
+                        ))
+                    })?;
             }
             (Some(_), None) | (None, Some(_)) => {
                 return Err(config_error(
@@ -190,7 +222,13 @@ pub(crate) fn build_async_http_client(
         }
     }
 
-    build_reqwest_client_with_custom_ca(builder).map_err(|error| Box::new(error) as Box<dyn Error>)
+    Ok(crate::network_policy::RuntimeHttpClient {
+        client: codex_http_client::HttpClientBuilder::new()
+            .without_request_logging()
+            .build_with_tls(factory, codex_http_client::ClientRouteClass::Other, config),
+        timeout: resolve_otlp_timeout(timeout_var),
+        runtime: tokio::runtime::Handle::try_current()?,
+    })
 }
 
 pub(crate) fn resolve_otlp_timeout(signal_var: &str) -> Duration {

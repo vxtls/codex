@@ -3,17 +3,16 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Constraint;
 use ratatui::layout::Layout;
 use ratatui::layout::Rect;
+use ratatui::style::Stylize;
 use ratatui::text::Line;
 use ratatui::widgets::Widget;
 use ratatui::widgets::WidgetRef;
 
+use super::picker_rows::render_rows_single_line;
 use super::popup_consts::MAX_POPUP_ROWS;
 use super::scroll_state::ScrollState;
 use super::selection_popup_common::GenericDisplayRow;
-use super::selection_popup_common::render_rows_single_line;
 use crate::key_hint;
-use crate::render::Insets;
-use crate::render::RectExt;
 use crate::text_formatting::truncate_text;
 use codex_utils_fuzzy_match::fuzzy_match;
 
@@ -26,6 +25,36 @@ pub(crate) struct MentionItem {
     pub(crate) path: Option<String>,
     pub(crate) category_tag: Option<String>,
     pub(crate) sort_rank: u8,
+}
+
+/// The best fuzzy match for a mention and the display-name positions that can be highlighted.
+///
+/// `display_name_indices` is absent when only an alternate search term matched.
+pub(crate) struct MentionMatch {
+    display_name_indices: Option<Vec<usize>>,
+    score: i32,
+}
+
+impl MentionItem {
+    /// Matches the display name first, then falls back to the best distinct search term.
+    pub(crate) fn fuzzy_match_query(&self, query: &str) -> Option<MentionMatch> {
+        if let Some((indices, score)) = fuzzy_match(&self.display_name, query) {
+            Some(MentionMatch {
+                display_name_indices: Some(indices),
+                score,
+            })
+        } else {
+            self.search_terms
+                .iter()
+                .filter(|term| *term != &self.display_name)
+                .filter_map(|term| fuzzy_match(term, query).map(|(_indices, score)| score))
+                .min()
+                .map(|score| MentionMatch {
+                    display_name_indices: None,
+                    score,
+                })
+        }
+    }
 }
 
 const MENTION_NAME_TRUNCATE_LEN: usize = 28;
@@ -58,7 +87,7 @@ impl SkillPopup {
     pub(crate) fn calculate_required_height(&self, _width: u16) -> u16 {
         let rows = self.rows_from_matches(self.filtered());
         let visible = rows.len().clamp(1, MAX_POPUP_ROWS);
-        (visible as u16).saturating_add(2)
+        (visible as u16).saturating_add(/*rhs*/ 3)
     }
 
     pub(crate) fn move_up(&mut self) {
@@ -96,29 +125,29 @@ impl SkillPopup {
     ) -> Vec<GenericDisplayRow> {
         matches
             .into_iter()
-            .map(|(idx, indices, _score)| {
+            .enumerate()
+            .map(|(visible_idx, (idx, indices, _score))| {
                 let mention = &self.mentions[idx];
                 let name = truncate_text(&mention.display_name, MENTION_NAME_TRUNCATE_LEN);
-                let description = match (
-                    mention.category_tag.as_deref(),
-                    mention.description.as_deref(),
-                ) {
-                    (Some(tag), Some(description)) if !description.is_empty() => {
-                        Some(format!("{tag} {description}"))
-                    }
-                    (Some(tag), _) => Some(tag.to_string()),
-                    (None, Some(description)) if !description.is_empty() => {
-                        Some(description.to_string())
-                    }
-                    _ => None,
-                };
                 GenericDisplayRow {
+                    category_tag: mention.category_tag.clone(),
+                    selection_style: Some(super::picker_style::selection_style()),
                     name,
-                    name_prefix_spans: Vec::new(),
+                    name_prefix_spans: vec![
+                        if self.state.selected_idx == Some(visible_idx) {
+                            "› "
+                        } else {
+                            "  "
+                        }
+                        .into(),
+                    ],
                     match_indices: indices,
                     display_shortcut: None,
-                    description,
-                    category_tag: None,
+                    description: mention
+                        .description
+                        .as_ref()
+                        .filter(|description| !description.is_empty())
+                        .cloned(),
                     is_disabled: false,
                     disabled_reason: None,
                     wrap_indent: None,
@@ -137,21 +166,8 @@ impl SkillPopup {
                 continue;
             }
 
-            let best_match =
-                if let Some((indices, score)) = fuzzy_match(&mention.display_name, filter) {
-                    Some((Some(indices), score))
-                } else {
-                    mention
-                        .search_terms
-                        .iter()
-                        .filter(|term| *term != &mention.display_name)
-                        .filter_map(|term| fuzzy_match(term, filter).map(|(_indices, score)| score))
-                        .min()
-                        .map(|score| (None, score))
-                };
-
-            if let Some((indices, score)) = best_match {
-                out.push((idx, indices, score));
+            if let Some(mention_match) = mention.fuzzy_match_query(filter) {
+                out.push((idx, mention_match.display_name_indices, mention_match.score));
             }
         }
 
@@ -183,22 +199,17 @@ impl SkillPopup {
 
 impl WidgetRef for SkillPopup {
     fn render_ref(&self, area: Rect, buf: &mut Buffer) {
-        let (list_area, hint_area) = if area.height > 2 {
-            let [list_area, _spacer_area, hint_area] = Layout::vertical([
-                Constraint::Length(area.height - 2),
-                Constraint::Length(1),
-                Constraint::Length(1),
-            ])
-            .areas(area);
+        let (list_area, hint_area) = if area.height > 1 {
+            let [list_area, hint_area] =
+                Layout::vertical([Constraint::Length(area.height - 1), Constraint::Length(1)])
+                    .areas(area);
             (list_area, Some(hint_area))
         } else {
             (area, None)
         };
         let rows = self.rows_from_matches(self.filtered());
         render_rows_single_line(
-            list_area.inset(Insets::tlbr(
-                /*top*/ 0, /*left*/ 2, /*bottom*/ 0, /*right*/ 0,
-            )),
+            list_area,
             buf,
             &rows,
             &self.state,
@@ -219,11 +230,10 @@ impl WidgetRef for SkillPopup {
 
 fn skill_popup_hint_line() -> Line<'static> {
     Line::from(vec![
-        "Press ".into(),
         key_hint::plain(KeyCode::Enter).into(),
-        " to insert or ".into(),
+        " insert · ".dim(),
         key_hint::plain(KeyCode::Esc).into(),
-        " to close".into(),
+        " close".dim(),
     ])
 }
 
@@ -292,7 +302,7 @@ mod tests {
         );
         assert_eq!(
             popup.calculate_required_height(72),
-            (MAX_POPUP_ROWS as u16) + 2
+            (MAX_POPUP_ROWS as u16) + 3
         );
     }
 
@@ -312,6 +322,59 @@ mod tests {
         }
 
         insta::assert_snapshot!("skill_popup_scrolled", render_popup(&popup, /*width*/ 72));
+    }
+
+    #[test]
+    fn category_tags_distinguish_mentions_when_descriptions_hide() {
+        let mut snapshots = Vec::new();
+        for name in ["Shared", "Shared mention with a very long name"] {
+            let mut popup = SkillPopup::new(
+                [("[App]", 0), ("[Skill]", 1)]
+                    .into_iter()
+                    .map(|(tag, rank)| MentionItem {
+                        description: Some("Secondary details".to_string()),
+                        ..ranked_mention_item(name, &[], tag, rank)
+                    })
+                    .collect(),
+            );
+            popup.set_query("Shared");
+
+            for width in [32, 72] {
+                let rendered = render_popup(&popup, width);
+                assert!(rendered.contains("[App]"), "{rendered}");
+                assert!(rendered.contains("[Skill]"), "{rendered}");
+                assert_eq!(rendered.contains("Secondary details"), width == 72);
+                snapshots.push(format!("name={name:?}, width={width}\n{rendered}"));
+            }
+        }
+        insta::assert_snapshot!("skill_popup_category_tags", snapshots.join("\n\n"));
+    }
+
+    #[test]
+    fn lowercase_expansion_preserves_match_ranking_and_highlighting() {
+        let mut popup = SkillPopup::new(vec![
+            named_mention_item("İx", &[]),
+            named_mention_item("i\u{0307}x", &[]),
+            named_mention_item("aİx", &[]),
+            named_mention_item("ai\u{0307}x", &[]),
+        ]);
+        popup.set_query("\u{0307}x");
+
+        // Each pair lowercases identically. The dot starts a contiguous match,
+        // but not a prefix, even when it came from the expansion of 'İ'.
+        assert_eq!(
+            popup.filtered(),
+            vec![
+                (3, Some(vec![2, 3]), 0),
+                (2, Some(vec![1, 2]), 0),
+                (1, Some(vec![1, 2]), 0),
+                (0, Some(vec![0, 1]), 0),
+            ]
+        );
+        insta::assert_snapshot!(
+            "skill_popup_lowercase_expansion",
+            render_popup(&popup, /*width*/ 48)
+        );
     }
 
     #[test]

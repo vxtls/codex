@@ -1,4 +1,4 @@
-use codex_client::OutboundProxyConfig;
+use codex_http_client::HttpClientFactory;
 
 /// Auth-layer adapter around client-owned proxy policy.
 ///
@@ -6,17 +6,41 @@ use codex_client::OutboundProxyConfig;
 /// client layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthRouteConfig {
-    route_config: OutboundProxyConfig,
+    http_client_factory: HttpClientFactory,
+    local_bootstrap_factory: Option<HttpClientFactory>,
 }
 
 impl AuthRouteConfig {
-    pub fn respect_system_proxy() -> Self {
+    /// Adapts an application-resolved HTTP client factory for auth requests.
+    pub fn from_http_client_factory(http_client_factory: HttpClientFactory) -> Self {
         Self {
-            route_config: OutboundProxyConfig::respect_system_proxy(),
+            http_client_factory,
+            local_bootstrap_factory: None,
         }
     }
 
-    pub(crate) fn route_config(&self) -> &OutboundProxyConfig {
-        &self.route_config
+    /// Installs the configuration owner's local-only policy for auth discovery.
+    /// Only auth-owned endpoint constructors can access this factory.
+    pub fn with_local_bootstrap_factory(mut self, factory: HttpClientFactory) -> Self {
+        self.local_bootstrap_factory = Some(factory);
+        self
+    }
+
+    pub(crate) fn authentication_factory(&self, endpoint: &str) -> HttpClientFactory {
+        let Some(factory) = &self.local_bootstrap_factory else {
+            return self.http_client_factory.clone();
+        };
+        let endpoints = endpoint.parse().into_iter().collect();
+        factory.clone().with_network_policy(
+            factory
+                .network_policy()
+                .clone()
+                .restrict_to_endpoints(endpoints),
+        )
+    }
+
+    /// Returns the HTTP client factory represented by this routing configuration.
+    pub fn http_client_factory(&self) -> &HttpClientFactory {
+        &self.http_client_factory
     }
 }

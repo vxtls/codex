@@ -29,6 +29,7 @@ pub mod context_snapshot;
 pub mod hooks;
 pub mod process;
 pub mod responses;
+pub mod startup;
 pub mod streaming_sse;
 pub mod test_codex;
 pub mod test_codex_exec;
@@ -36,9 +37,15 @@ mod test_environment;
 pub mod tracing;
 pub mod zsh_fork;
 
-pub use test_environment::TestEnvironment;
-pub use test_environment::get_remote_test_env;
-pub use test_environment::test_environment;
+pub(crate) use test_environment::TestEnvironment;
+pub use test_environment::TestTargetOs;
+pub use test_environment::is_remote_test_environment;
+#[doc(hidden)]
+pub use test_environment::is_wine_exec_test_environment;
+#[doc(hidden)]
+pub use test_environment::test_docker_container_name;
+pub(crate) use test_environment::test_environment;
+pub use test_environment::test_target_os;
 
 static TEST_ARG0_PATH_ENTRY: OnceLock<Option<Arg0PathEntryGuard>> = OnceLock::new();
 
@@ -306,7 +313,12 @@ pub async fn submit_thread_settings(
     use tokio::time::Duration;
     use tokio::time::timeout;
 
-    let submission_id = codex.submit(Op::ThreadSettings { thread_settings }).await?;
+    let submission_id = codex
+        .submit(Op::ThreadSettings {
+            thread_settings,
+            reply: None,
+        })
+        .await?;
     loop {
         let ev = timeout(Duration::from_secs(10), codex.next_event())
             .await
@@ -319,6 +331,40 @@ pub async fn submit_thread_settings(
                 other => panic!("unexpected thread settings update event: {other:?}"),
             }
         }
+    }
+}
+
+/// For sequential tests, register this contributor and wait once after every completed turn.
+/// Notifications are thread-scoped so a child or sibling cannot satisfy the wait.
+pub struct ThreadIdle;
+
+#[derive(Default)]
+struct ThreadIdleNotification(tokio::sync::Notify);
+
+impl codex_extension_api::ThreadLifecycleContributor<Config> for ThreadIdle {
+    fn on_thread_idle<'a>(
+        &'a self,
+        input: codex_extension_api::ThreadIdleInput<'a>,
+    ) -> codex_extension_api::ExtensionFuture<'a, ()> {
+        Box::pin(async move {
+            input
+                .thread_store
+                .get_or_init(ThreadIdleNotification::default)
+                .0
+                .notify_one();
+        })
+    }
+}
+
+impl ThreadIdle {
+    pub async fn wait(thread: &CodexThread) {
+        // TurnComplete is sent before active-turn cleanup. Rollback requires the later idle signal.
+        let idle = thread
+            .thread_extension_data()
+            .get_or_init(ThreadIdleNotification::default);
+        tokio::time::timeout(std::time::Duration::from_secs(10), idle.0.notified())
+            .await
+            .expect("thread should become idle after turn completion");
     }
 }
 
@@ -574,21 +620,18 @@ macro_rules! skip_if_no_network {
 }
 
 // Exported so the public skip macros can expand in downstream test crates.
-// Call `skip_if_remote!` or `skip_if_wine_exec!` instead.
 #[macro_export]
 #[doc(hidden)]
-macro_rules! skip_if_test_environment {
-    ($pattern:pat, $reason:expr $(,)?) => {{
-        let environment = $crate::test_environment();
-        if ::std::matches!(&environment, $pattern) {
-            eprintln!("Skipping test in {environment:?}: {}", $reason);
+macro_rules! skip_if_test_condition {
+    ($condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return;
         }
     }};
-    ($return_value:expr, $pattern:pat, $reason:expr $(,)?) => {{
-        let environment = $crate::test_environment();
-        if ::std::matches!(&environment, $pattern) {
-            eprintln!("Skipping test in {environment:?}: {}", $reason);
+    ($return_value:expr, $condition:expr, $environment:expr, $reason:expr $(,)?) => {{
+        if $condition {
+            eprintln!("Skipping test in {}: {}", $environment, $reason);
             return $return_value;
         }
     }};
@@ -597,29 +640,71 @@ macro_rules! skip_if_test_environment {
 #[macro_export]
 macro_rules! skip_if_remote {
     ($reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!(
-            $crate::TestEnvironment::Docker { .. } | $crate::TestEnvironment::WineExec,
+        $crate::skip_if_test_condition!(
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
             $reason,
         );
     }};
     ($return_value:expr, $reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!(
+        $crate::skip_if_test_condition!(
             $return_value,
-            $crate::TestEnvironment::Docker { .. } | $crate::TestEnvironment::WineExec,
+            $crate::is_remote_test_environment(),
+            "a remote test environment",
             $reason,
         );
     }};
 }
 
 #[macro_export]
+macro_rules! skip_if_no_remote_env {
+    () => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return;
+        }
+    }};
+    ($return_value:expr $(,)?) => {{
+        if !$crate::is_remote_test_environment() {
+            eprintln!("Skipping test because it requires a remote test environment.");
+            return $return_value;
+        }
+    }};
+}
+
+#[macro_export]
 macro_rules! skip_if_wine_exec {
     ($reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!($crate::TestEnvironment::WineExec, $reason);
+        $crate::skip_if_test_condition!(
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
     }};
     ($return_value:expr, $reason:expr $(,)?) => {{
-        $crate::skip_if_test_environment!(
+        $crate::skip_if_test_condition!(
             $return_value,
-            $crate::TestEnvironment::WineExec,
+            $crate::is_wine_exec_test_environment(),
+            "the Wine-exec test environment",
+            $reason,
+        );
+    }};
+}
+
+#[macro_export]
+macro_rules! skip_if_target_windows {
+    ($reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
+            $reason,
+        );
+    }};
+    ($return_value:expr, $reason:expr $(,)?) => {{
+        $crate::skip_if_test_condition!(
+            $return_value,
+            $crate::test_target_os() == $crate::TestTargetOs::Windows,
+            "a Windows target environment",
             $reason,
         );
     }};
@@ -662,7 +747,7 @@ macro_rules! codex_linux_sandbox_exe_or_skip {
 }
 
 #[macro_export]
-macro_rules! skip_if_windows {
+macro_rules! skip_if_host_windows {
     ($return_value:expr $(,)?) => {{
         if cfg!(target_os = "windows") {
             println!("Skipping test because it cannot execute on Windows.");

@@ -250,10 +250,6 @@ pub struct NetworkDomainPermissionsToml {
 }
 
 impl NetworkDomainPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     pub fn allowed_domains(&self) -> Option<Vec<String>> {
         let allowed_domains: Vec<String> = self
             .entries
@@ -301,10 +297,6 @@ pub struct NetworkUnixSocketPermissionsToml {
 }
 
 impl NetworkUnixSocketPermissionsToml {
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
     pub fn allow_unix_sockets(&self) -> Vec<String> {
         self.entries
             .iter()
@@ -348,6 +340,9 @@ pub struct NetworkToml {
     pub mode: Option<NetworkMode>,
     pub domains: Option<NetworkDomainPermissionsToml>,
     pub unix_sockets: Option<NetworkUnixSocketPermissionsToml>,
+    /// Permits local servers and direct host-loopback connections and skips the proxy's
+    /// additional private-network destination checks. Proxy domain rules still apply.
+    /// Defaults to true for MXC, which cannot enforce false; otherwise defaults to false.
     pub allow_local_binding: Option<bool>,
     pub mitm: Option<NetworkMitmToml>,
 }
@@ -453,29 +448,6 @@ impl NetworkMitmToml {
         Ok(())
     }
 
-    pub fn validate_action_references(
-        &self,
-        actions_by_name: &IndexMap<String, NetworkMitmActionToml>,
-    ) -> Result<(), String> {
-        self.validate_action_definitions()?;
-
-        let Some(hooks) = self.hooks.as_ref() else {
-            return Ok(());
-        };
-
-        for (hook_name, hook) in hooks {
-            for action_name in &hook.action {
-                if !actions_by_name.contains_key(action_name) {
-                    return Err(format!(
-                        "network.mitm.hooks.{hook_name}.action references undefined action `{action_name}`"
-                    ));
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     pub fn to_runtime_hooks(
         &self,
         actions_by_name: Option<&IndexMap<String, NetworkMitmActionToml>>,
@@ -501,40 +473,39 @@ impl NetworkMitmActionToml {
 impl NetworkToml {
     pub fn apply_to_network_proxy_config(&self, config: &mut NetworkProxyConfig) {
         if let Some(enabled) = self.enabled {
-            config.network.enabled = enabled;
+            config.enabled = enabled;
         }
         if let Some(proxy_url) = self.proxy_url.as_ref() {
-            config.network.proxy_url = proxy_url.clone();
+            config.proxy_url = proxy_url.clone();
         }
         if let Some(enable_socks5) = self.enable_socks5 {
-            config.network.enable_socks5 = enable_socks5;
+            config.enable_socks5 = enable_socks5;
         }
         if let Some(socks_url) = self.socks_url.as_ref() {
-            config.network.socks_url = socks_url.clone();
+            config.socks_url = socks_url.clone();
         }
         if let Some(enable_socks5_udp) = self.enable_socks5_udp {
-            config.network.enable_socks5_udp = enable_socks5_udp;
+            config.enable_socks5_udp = enable_socks5_udp;
         }
         if let Some(allow_upstream_proxy) = self.allow_upstream_proxy {
-            config.network.allow_upstream_proxy = allow_upstream_proxy;
+            config.allow_upstream_proxy = allow_upstream_proxy;
         }
         if let Some(dangerously_allow_non_loopback_proxy) =
             self.dangerously_allow_non_loopback_proxy
         {
-            config.network.dangerously_allow_non_loopback_proxy =
-                dangerously_allow_non_loopback_proxy;
+            config.dangerously_allow_non_loopback_proxy = dangerously_allow_non_loopback_proxy;
         }
         if let Some(dangerously_allow_all_unix_sockets) = self.dangerously_allow_all_unix_sockets {
-            config.network.dangerously_allow_all_unix_sockets = dangerously_allow_all_unix_sockets;
+            config.dangerously_allow_all_unix_sockets = Some(dangerously_allow_all_unix_sockets);
         }
         if let Some(mode) = self.mode {
-            config.network.mode = mode;
+            config.mode = mode;
         }
         if let Some(domains) = self.domains.as_ref() {
             overlay_network_domain_permissions(config, domains);
         }
         if let Some(unix_sockets) = self.unix_sockets.as_ref() {
-            let mut proxy_unix_sockets = config.network.unix_sockets.take().unwrap_or_default();
+            let mut proxy_unix_sockets = config.unix_sockets.take().unwrap_or_default();
             for (path, permission) in &unix_sockets.entries {
                 let permission = match permission {
                     NetworkUnixSocketPermissionToml::Allow => {
@@ -544,17 +515,15 @@ impl NetworkToml {
                 };
                 proxy_unix_sockets.entries.insert(path.clone(), permission);
             }
-            config.network.unix_sockets =
-                (!proxy_unix_sockets.entries.is_empty()).then_some(proxy_unix_sockets);
+            config.unix_sockets = Some(proxy_unix_sockets);
         }
         if let Some(allow_local_binding) = self.allow_local_binding {
-            config.network.allow_local_binding = allow_local_binding;
+            config.allow_local_binding = Some(allow_local_binding);
         }
         if let Some(mitm) = self.mitm.as_ref() {
-            config.network.mitm_hooks = mitm.to_runtime_hooks(mitm.actions.as_ref());
+            config.mitm_hooks = mitm.to_runtime_hooks(mitm.actions.as_ref());
         }
-        config.network.mitm =
-            config.network.mode == NetworkMode::Limited || !config.network.mitm_hooks.is_empty();
+        config.mitm = config.mode == NetworkMode::Limited || !config.mitm_hooks.is_empty();
     }
 
     pub fn to_network_proxy_config(&self) -> NetworkProxyConfig {
@@ -628,8 +597,6 @@ pub fn overlay_network_domain_permissions(
             NetworkDomainPermissionToml::Allow => ProxyNetworkDomainPermission::Allow,
             NetworkDomainPermissionToml::Deny => ProxyNetworkDomainPermission::Deny,
         };
-        config
-            .network
-            .upsert_domain_permission(pattern.clone(), permission, normalize_host);
+        config.upsert_domain_permission(pattern.clone(), permission, normalize_host);
     }
 }

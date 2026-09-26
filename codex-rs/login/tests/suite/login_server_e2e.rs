@@ -9,7 +9,12 @@ use std::time::Duration;
 use anyhow::Result;
 use base64::Engine;
 use codex_config::types::AuthCredentialsStoreMode;
+use codex_http_client::HttpClientBuilder;
 use codex_login::AuthKeyringBackendKind;
+use codex_login::LoginCallbackResult;
+use codex_login::LoginOnboardingEntrypoint;
+use codex_login::LoginSuccessPage;
+use codex_login::LoginSuccessPageBrand;
 use codex_login::ServerOptions;
 use codex_login::run_login_server;
 use core_test_support::skip_if_no_network;
@@ -118,11 +123,25 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 
     // Run server in background
     let server_home = codex_home.clone();
+    let content = codex_http_client::NetworkPolicyController::default();
+    let local = codex_http_client::NetworkPolicyController::default();
+    let local_policy = local.policy();
+    local.publish(
+        local_policy.revision(),
+        codex_http_client::DestinationPolicy::Unrestricted,
+    );
+    let factory = codex_http_client::HttpClientFactory::new(
+        codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+    );
+    let routes = codex_login::AuthRouteConfig::from_http_client_factory(
+        factory.clone().with_network_policy(content.policy()),
+    )
+    .with_local_bootstrap_factory(factory.with_network_policy(local_policy));
 
     let opts = ServerOptions {
         codex_home: server_home,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: routes,
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: 0,
@@ -131,6 +150,7 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
         forced_chatgpt_workspace_id: Some(vec![chatgpt_account_id.to_string()]),
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
     assert!(
@@ -140,17 +160,64 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
         "auth URL should include forced workspace parameter"
     );
     let login_port = server.actual_port;
+    let callback_url = Url::parse(&server.auth_url)?
+        .query_pairs()
+        .find_map(|(key, value)| (key == "redirect_uri").then(|| value.into_owned()))
+        .expect("auth URL should include a redirect URI");
+    assert_eq!(
+        callback_url,
+        format!("http://127.0.0.1:{login_port}/auth/callback")
+    );
 
-    // Simulate browser callback, and follow redirect to /success
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::limited(5))
-        .build()?;
-    let url = format!("http://127.0.0.1:{login_port}/auth/callback?code=abc&state=test_state_123");
+    // Simulate browser callback and assert the local success redirect before following it.
+    let client = HttpClientBuilder::new()
+        .without_redirects()
+        .build_direct()?;
+    // Reject unrecognized metadata before processing codes or provider errors.
+    for state in [
+        "wrong_state.onboarding_entrypoint=life_sciences",
+        "test_state_123.onboarding_entrypoint=unknown",
+        "test_state_123.onboarding_entrypoint=life_sciences.onboarding_entrypoint=life_sciences",
+        "test_state_123.extra=value.onboarding_entrypoint=life_sciences",
+    ] {
+        let response = client
+            .get(&callback_url)
+            .query(&[
+                ("state", state),
+                ("code", "untrusted"),
+                ("error", "access_denied"),
+            ])
+            .send()
+            .await?;
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.text().await?, "State mismatch");
+    }
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&std::fs::read_to_string(
+            codex_home.join("auth.json")
+        )?)?,
+        stale_auth
+    );
+    let url =
+        format!("{callback_url}?code=abc&state=test_state_123.onboarding_entrypoint=life_sciences");
     let resp = client.get(&url).send().await?;
-    assert!(resp.status().is_success());
+    assert_eq!(resp.status(), 302);
+    let success_url = resp.headers()["location"].to_str()?;
+    let success_url = Url::parse(success_url)?;
+    assert_eq!(success_url.origin(), Url::parse(&callback_url)?.origin());
+    assert_eq!(success_url.path(), "/success");
+
+    let success_resp = client.get(success_url).send().await?;
+    assert!(success_resp.status().is_success());
 
     // Wait for server shutdown
-    server.block_until_done().await?;
+    let callback_result = server.block_until_done_with_callback_result().await?;
+    assert_eq!(
+        callback_result,
+        LoginCallbackResult {
+            onboarding_entrypoint: Some(LoginOnboardingEntrypoint::LifeSciences),
+        }
+    );
 
     // Validate auth.json
     let auth_path = codex_home.join("auth.json");
@@ -166,6 +233,52 @@ async fn end_to_end_login_flow_persists_auth_json() -> Result<()> {
 
     // Stop mock issuer
     drop(issuer_handle);
+    Ok(())
+}
+
+#[tokio::test]
+async fn hosted_login_redirects_to_configured_open_app_url() -> Result<()> {
+    skip_if_no_network!(Ok(()));
+
+    let (issuer_addr, _issuer_handle) = start_mock_issuer(WORKSPACE_ID_ALLOWED);
+    let issuer = format!("http://{}:{}", issuer_addr.ip(), issuer_addr.port());
+    let tmp = tempdir()?;
+    let server = run_login_server(ServerOptions {
+        codex_home: tmp.path().to_path_buf(),
+        cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
+        client_id: codex_login::CLIENT_ID.to_string(),
+        issuer,
+        port: 0,
+        open_browser: false,
+        force_state: Some("streamlined_state".to_string()),
+        forced_chatgpt_workspace_id: None,
+        codex_streamlined_login: false,
+        login_success_page: LoginSuccessPage::Hosted {
+            url: Url::parse("http://localhost:3000/codex/open-app?source=old")?,
+            app_brand: LoginSuccessPageBrand::Chatgpt,
+        },
+        auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+    })?;
+    let login_port = server.actual_port;
+    let client = HttpClientBuilder::new()
+        .without_redirects()
+        .build_direct()?;
+
+    let response = client
+        .get(format!(
+            "http://127.0.0.1:{login_port}/auth/callback?code=abc&state=streamlined_state"
+        ))
+        .send()
+        .await?;
+
+    assert_eq!(response.status(), 302);
+    assert_eq!(
+        response.headers()["location"].to_str()?,
+        "http://localhost:3000/codex/open-app?source=login&app_brand=chatgpt"
+    );
+    tokio::time::timeout(Duration::from_secs(1), server.block_until_done()).await??;
+
     Ok(())
 }
 
@@ -186,7 +299,7 @@ async fn creates_missing_codex_home_dir() -> Result<()> {
     let opts = ServerOptions {
         codex_home: server_home,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: 0,
@@ -195,11 +308,12 @@ async fn creates_missing_codex_home_dir() -> Result<()> {
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
     let login_port = server.actual_port;
 
-    let client = reqwest::Client::new();
+    let client = HttpClientBuilder::new().build_direct()?;
     let url = format!("http://127.0.0.1:{login_port}/auth/callback?code=abc&state=state2");
     let resp = client.get(&url).send().await?;
     assert!(resp.status().is_success());
@@ -228,7 +342,7 @@ async fn login_server_includes_forced_workspaces_as_one_query_param() -> Result<
     let opts = ServerOptions {
         codex_home,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: 0,
@@ -240,6 +354,7 @@ async fn login_server_includes_forced_workspaces_as_one_query_param() -> Result<
         ]),
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
     let auth_url = Url::parse(&server.auth_url)?;
@@ -271,7 +386,7 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
     let opts = ServerOptions {
         codex_home: codex_home.clone(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: 0,
@@ -280,6 +395,7 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
         forced_chatgpt_workspace_id: Some(vec![WORKSPACE_ID_ALLOWED.to_string()]),
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
     assert!(
@@ -290,7 +406,7 @@ async fn forced_chatgpt_workspace_id_mismatch_blocks_login() -> Result<()> {
     );
     let login_port = server.actual_port;
 
-    let client = reqwest::Client::new();
+    let client = HttpClientBuilder::new().build_direct()?;
     let url = format!("http://127.0.0.1:{login_port}/auth/callback?code=abc&state={state}");
     let resp = client.get(&url).send().await?;
     assert!(resp.status().is_success());
@@ -333,7 +449,7 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
     let opts = ServerOptions {
         codex_home: codex_home.clone(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: 0,
@@ -342,11 +458,12 @@ async fn oauth_access_denied_missing_entitlement_blocks_login_with_clear_error()
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
     let login_port = server.actual_port;
 
-    let client = reqwest::Client::new();
+    let client = HttpClientBuilder::new().build_direct()?;
     let url = format!(
         "http://127.0.0.1:{login_port}/auth/callback?state={state}&error=access_denied&error_description=missing_codex_entitlement"
     );
@@ -403,7 +520,7 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
     let opts = ServerOptions {
         codex_home: codex_home.clone(),
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: 0,
@@ -412,11 +529,12 @@ async fn oauth_access_denied_unknown_reason_uses_generic_error_page() -> Result<
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
     let server = run_login_server(opts)?;
     let login_port = server.actual_port;
 
-    let client = reqwest::Client::new();
+    let client = HttpClientBuilder::new().build_direct()?;
     let url = format!(
         "http://127.0.0.1:{login_port}/auth/callback?state={state}&error=access_denied&error_description=some_other_reason"
     );
@@ -513,7 +631,7 @@ async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() ->
         /*forced_chatgpt_workspace_id*/ None,
         AuthCredentialsStoreMode::File,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     );
     opts.issuer = issuer;
     opts.open_browser = false;
@@ -533,7 +651,7 @@ async fn falls_back_to_registered_fallback_port_when_default_port_is_in_use() ->
 
     assert_eq!(actual_port, FALLBACK_LOGIN_PORT);
     assert!(auth_url.contains(&format!(
-        "redirect_uri=http%3A%2F%2Flocalhost%3A{FALLBACK_LOGIN_PORT}%2Fauth%2Fcallback"
+        "redirect_uri=http%3A%2F%2F127.0.0.1%3A{FALLBACK_LOGIN_PORT}%2Fauth%2Fcallback"
     )));
 
     Ok(())
@@ -552,7 +670,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
     let first_opts = ServerOptions {
         codex_home: first_codex_home,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer: issuer.clone(),
         port: 0,
@@ -561,6 +679,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
 
     let first_server = run_login_server(first_opts)?;
@@ -575,7 +694,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
     let second_opts = ServerOptions {
         codex_home: second_codex_home,
         cli_auth_credentials_store_mode: AuthCredentialsStoreMode::File,
-        auth_route_config: None,
+        auth_route_config: codex_login::test_support::transport_default_auth_route_config(),
         client_id: codex_login::CLIENT_ID.to_string(),
         issuer,
         port: login_port,
@@ -584,6 +703,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
         forced_chatgpt_workspace_id: None,
         codex_streamlined_login: false,
         auth_keyring_backend_kind: AuthKeyringBackendKind::Direct,
+        login_success_page: LoginSuccessPage::Local,
     };
 
     let second_server = run_login_server(second_opts)?;
@@ -595,7 +715,7 @@ async fn cancels_previous_login_server_when_port_is_in_use() -> Result<()> {
         .expect_err("login server should report cancellation");
     assert_eq!(cancel_result.kind(), io::ErrorKind::Interrupted);
 
-    let client = reqwest::Client::new();
+    let client = HttpClientBuilder::new().build_direct()?;
     let cancel_url = format!("http://127.0.0.1:{login_port}/cancel");
     let resp = client.get(cancel_url).send().await?;
     assert!(resp.status().is_success());

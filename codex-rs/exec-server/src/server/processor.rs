@@ -1,52 +1,171 @@
+use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 
+use codex_build_info::BuildInfo;
+use codex_exec_server_protocol::JSONRPCMessage;
 use tokio::sync::mpsc;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::debug;
 use tracing::warn;
 
 use crate::ExecServerRuntimePaths;
+use crate::LocalFileSystem;
 use crate::connection::CHANNEL_CAPACITY;
 use crate::connection::JsonRpcConnection;
 use crate::connection::JsonRpcConnectionEvent;
+use crate::discover_v2::capability_locations::CapabilityLocationRequest;
+use crate::discover_v2::capability_manager::CapabilityManager;
+use crate::rpc::RpcCallError;
 use crate::rpc::RpcNotificationSender;
 use crate::rpc::RpcServerOutboundMessage;
 use crate::rpc::encode_server_message;
-use crate::rpc::invalid_request;
-use crate::rpc::method_not_found;
+use crate::rpc_server_requests::RpcServerRequestSender;
 use crate::server::ExecServerHandler;
+use crate::server::RequestDispatchMode;
 use crate::server::registry::build_router;
+use crate::server::request_dispatcher::RequestDispatcher;
+use crate::server::request_dispatcher::RequestTaskResult;
 use crate::server::session_registry::SessionRegistry;
+use crate::telemetry::ConnectionTransport;
+use crate::telemetry::ExecServerTelemetry;
+use crate::telemetry::ExecutorRegistration;
+use codex_http_client::HttpClientFactory;
+use codex_utils_path_uri::PathUri;
 
 #[derive(Clone)]
 pub(crate) struct ConnectionProcessor {
+    capability_manager: Arc<CapabilityManager>,
+    capability_prewarm: Arc<AbortOnDropHandle<()>>,
     session_registry: Arc<SessionRegistry>,
     runtime_paths: ExecServerRuntimePaths,
+    telemetry: ExecServerTelemetry,
+    http_client_factory: HttpClientFactory,
+    request_dispatch_mode: RequestDispatchMode,
 }
 
 impl ConnectionProcessor {
+    #[cfg(test)]
     pub(crate) fn new(runtime_paths: ExecServerRuntimePaths) -> Self {
-        Self {
-            session_registry: SessionRegistry::new(),
+        Self::new_with_location_request(
             runtime_paths,
+            ExecServerTelemetry::default(),
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+            RequestDispatchMode::Inline,
+            // Connection-only tests must not scan the real user home.
+            Err(io::Error::other(
+                "capability home paths not supplied by this test",
+            )),
+        )
+    }
+
+    pub(crate) fn new_with_telemetry(
+        runtime_paths: ExecServerRuntimePaths,
+        telemetry: ExecServerTelemetry,
+        http_client_factory: HttpClientFactory,
+        request_dispatch_mode: RequestDispatchMode,
+    ) -> Self {
+        let request =
+            codex_utils_home_dir::find_codex_home().map(|codex_home| CapabilityLocationRequest {
+                codex_home: PathUri::from_abs_path(&codex_home),
+                user_home: dirs::home_dir()
+                    .and_then(|home| PathUri::from_host_native_path(home).ok()),
+            });
+        Self::new_with_location_request(
+            runtime_paths,
+            telemetry,
+            http_client_factory,
+            request_dispatch_mode,
+            request,
+        )
+    }
+
+    fn new_with_location_request(
+        runtime_paths: ExecServerRuntimePaths,
+        telemetry: ExecServerTelemetry,
+        http_client_factory: HttpClientFactory,
+        request_dispatch_mode: RequestDispatchMode,
+        request: io::Result<CapabilityLocationRequest>,
+    ) -> Self {
+        // Library callers may bypass CLI startup. Capture the version before serving clients.
+        let _ = BuildInfo::get();
+        let capability_manager =
+            CapabilityManager::new(LocalFileSystem::with_runtime_paths(runtime_paths.clone()));
+        let manager = Arc::clone(&capability_manager);
+        // Start before any client connects; all sessions share these inert global locations.
+        let prewarm = tokio::spawn(async move {
+            // Home resolution failures are nonfatal, just like scan failures.
+            let result = match request {
+                Ok(request) => manager.prewarm_locations(request).await.map(|_| ()),
+                Err(error) => Err(error),
+            };
+            if let Err(error) = result {
+                tracing::warn!(error_kind = ?error.kind(), "capability location prewarming unavailable");
+            }
+        });
+        Self {
+            session_registry: SessionRegistry::new(telemetry.clone()),
+            capability_manager,
+            capability_prewarm: Arc::new(AbortOnDropHandle::new(prewarm)),
+            runtime_paths,
+            telemetry,
+            http_client_factory,
+            request_dispatch_mode,
         }
     }
 
-    pub(crate) async fn run_connection(&self, connection: JsonRpcConnection) {
+    pub(crate) async fn run_connection(
+        &self,
+        connection: JsonRpcConnection,
+        transport: ConnectionTransport,
+    ) {
         run_connection(
             connection,
-            Arc::clone(&self.session_registry),
-            self.runtime_paths.clone(),
+            self.clone(),
+            transport,
+            /*executor_registration*/ None,
         )
         .await;
+    }
+
+    pub(crate) async fn run_registered_connection(
+        &self,
+        connection: JsonRpcConnection,
+        executor_registration: Option<Arc<ExecutorRegistration>>,
+    ) {
+        run_connection(
+            connection,
+            self.clone(),
+            ConnectionTransport::Relay,
+            executor_registration,
+        )
+        .await;
+    }
+
+    pub(crate) async fn shutdown(&self) {
+        self.capability_prewarm.abort();
+        self.session_registry.shutdown().await;
     }
 }
 
 async fn run_connection(
     connection: JsonRpcConnection,
-    session_registry: Arc<SessionRegistry>,
-    runtime_paths: ExecServerRuntimePaths,
+    processor: ConnectionProcessor,
+    transport: ConnectionTransport,
+    executor_registration: Option<Arc<ExecutorRegistration>>,
 ) {
-    let router = Arc::new(build_router());
+    let ConnectionProcessor {
+        capability_manager: _capability_manager,
+        capability_prewarm: _capability_prewarm,
+        session_registry,
+        runtime_paths,
+        telemetry,
+        http_client_factory,
+        request_dispatch_mode,
+    } = processor;
+    let _connection_metrics = telemetry.connection_started(transport);
     let JsonRpcConnection {
         outgoing_tx: json_outgoing_tx,
         mut incoming_rx,
@@ -57,11 +176,15 @@ async fn run_connection(
     let (outgoing_tx, mut outgoing_rx) =
         mpsc::channel::<RpcServerOutboundMessage>(CHANNEL_CAPACITY);
     let notifications = RpcNotificationSender::new(outgoing_tx.clone());
-    let handler = Arc::new(ExecServerHandler::new(
+    let requests = notifications.request_sender();
+    let mut handler = ExecServerHandler::new(
         session_registry,
         notifications,
         runtime_paths,
-    ));
+        http_client_factory,
+    );
+    handler.executor_registration = executor_registration;
+    let handler = Arc::new(handler);
 
     let outbound_task = tokio::spawn(async move {
         while let Some(message) = outgoing_rx.recv().await {
@@ -78,104 +201,87 @@ async fn run_connection(
         }
     });
 
-    // Process inbound events sequentially to preserve initialize/initialized ordering.
-    while let Some(event) = incoming_rx.recv().await {
+    let mut dispatcher = RequestDispatcher::new(
+        Arc::new(build_router()),
+        Arc::clone(&handler),
+        outgoing_tx.clone(),
+        disconnected_rx.clone(),
+        requests.clone(),
+        telemetry,
+        request_dispatch_mode,
+    );
+
+    loop {
+        let has_request_tasks = dispatcher.has_tasks();
+        let event = tokio::select! {
+            result = dispatcher.join_next(), if has_request_tasks => {
+                if result == RequestTaskResult::ConnectionClosed {
+                    break;
+                }
+                continue;
+            }
+            _ = disconnected_rx.changed() => {
+                debug!("exec-server transport disconnected");
+                break;
+            }
+            event = incoming_rx.recv() => {
+                let Some(event) = event else {
+                    break;
+                };
+                event
+            }
+        };
+
         if !handler.is_session_attached() {
             debug!("exec-server connection evicted after session resume");
             break;
         }
-        match event {
+
+        let result = match event {
             JsonRpcConnectionEvent::MalformedMessage { reason } => {
-                warn!("ignoring malformed exec-server message: {reason}");
-                if outgoing_tx
-                    .send(RpcServerOutboundMessage::Error {
-                        request_id: codex_app_server_protocol::RequestId::Integer(-1),
-                        error: invalid_request(reason),
-                    })
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
+                dispatcher.handle_malformed_message(reason).await
             }
             JsonRpcConnectionEvent::Message(message) => match message {
-                codex_app_server_protocol::JSONRPCMessage::Request(request) => {
-                    if let Some(route) = router.request_route(request.method.as_str()) {
-                        let message = tokio::select! {
-                            message = route(Arc::clone(&handler), request) => message,
-                            _ = disconnected_rx.changed() => {
-                                debug!("exec-server transport disconnected while handling request");
-                                break;
-                            }
-                        };
-                        if let Some(message) = message
-                            && outgoing_tx.send(message).await.is_err()
-                        {
-                            break;
-                        }
-                    } else if outgoing_tx
-                        .send(RpcServerOutboundMessage::Error {
-                            request_id: request.id,
-                            error: method_not_found(format!(
-                                "exec-server stub does not implement `{}` yet",
-                                request.method
-                            )),
-                        })
+                JSONRPCMessage::Request(request) => {
+                    dispatcher
+                        .dispatch_request(request, tracing::Span::none(), Instant::now())
                         .await
-                        .is_err()
-                    {
-                        break;
-                    }
                 }
-                codex_app_server_protocol::JSONRPCMessage::Notification(notification) => {
-                    let Some(route) = router.notification_route(notification.method.as_str())
-                    else {
-                        warn!(
-                            "closing exec-server connection after unexpected notification: {}",
-                            notification.method
-                        );
-                        break;
-                    };
-                    let result = tokio::select! {
-                        result = route(Arc::clone(&handler), notification) => result,
-                        _ = disconnected_rx.changed() => {
-                            debug!(
-                                "exec-server transport disconnected while handling notification"
-                            );
-                            break;
-                        }
-                    };
-                    if let Err(err) = result {
-                        warn!("closing exec-server connection after protocol error: {err}");
-                        break;
-                    }
+                JSONRPCMessage::Notification(notification) => {
+                    dispatcher.handle_notification(notification).await
                 }
-                codex_app_server_protocol::JSONRPCMessage::Response(response) => {
-                    warn!(
-                        "closing exec-server connection after unexpected client response: {:?}",
-                        response.id
-                    );
-                    break;
-                }
-                codex_app_server_protocol::JSONRPCMessage::Error(error) => {
-                    warn!(
-                        "closing exec-server connection after unexpected client error: {:?}",
-                        error.id
-                    );
-                    break;
-                }
+                JSONRPCMessage::Response(response) => dispatcher.handle_response(response),
+                JSONRPCMessage::Error(error) => dispatcher.handle_error(error),
             },
+            JsonRpcConnectionEvent::QueuedRequest {
+                request,
+                request_span,
+                queued_at,
+            } => {
+                dispatcher
+                    .dispatch_request(request, request_span, queued_at)
+                    .await
+            }
             JsonRpcConnectionEvent::Disconnected { reason } => {
                 if let Some(reason) = reason {
                     debug!("exec-server connection disconnected: {reason}");
                 }
                 break;
             }
+        };
+        if result == RequestTaskResult::ConnectionClosed {
+            break;
         }
     }
 
+    if *disconnected_rx.borrow() {
+        complete_queued_client_responses(&requests, &mut incoming_rx);
+    }
+    requests.close();
+    dispatcher.shutdown().await;
     handler.shutdown().await;
     drop(handler);
+    drop(requests);
     drop(outgoing_tx);
     for task in connection_tasks {
         task.abort();
@@ -184,17 +290,42 @@ async fn run_connection(
     let _ = outbound_task.await;
 }
 
+fn complete_queued_client_responses(
+    requests: &RpcServerRequestSender,
+    incoming_rx: &mut mpsc::Receiver<JsonRpcConnectionEvent>,
+) {
+    while let Ok(event) = incoming_rx.try_recv() {
+        let (request_id, response) = match event {
+            JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(response)) => {
+                (response.id, Ok(response.result))
+            }
+            JsonRpcConnectionEvent::Message(JSONRPCMessage::Error(error)) => {
+                (error.id, Err(RpcCallError::Server(error.error)))
+            }
+            JsonRpcConnectionEvent::Message(
+                JSONRPCMessage::Request(_) | JSONRPCMessage::Notification(_),
+            )
+            | JsonRpcConnectionEvent::QueuedRequest { .. }
+            | JsonRpcConnectionEvent::MalformedMessage { .. }
+            | JsonRpcConnectionEvent::Disconnected { .. } => continue,
+        };
+        if !requests.complete(request_id.clone(), response) {
+            warn!("ignoring unexpected client response while disconnecting: {request_id:?}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
 
-    use codex_app_server_protocol::JSONRPCMessage;
-    use codex_app_server_protocol::JSONRPCNotification;
-    use codex_app_server_protocol::JSONRPCRequest;
-    use codex_app_server_protocol::JSONRPCResponse;
-    use codex_app_server_protocol::RequestId;
+    use codex_exec_server_protocol::JSONRPCMessage;
+    use codex_exec_server_protocol::JSONRPCNotification;
+    use codex_exec_server_protocol::JSONRPCRequest;
+    use codex_exec_server_protocol::JSONRPCResponse;
+    use codex_exec_server_protocol::RequestId;
     use codex_utils_path_uri::PathUri;
     use pretty_assertions::assert_eq;
     use serde::Serialize;
@@ -205,32 +336,106 @@ mod tests {
     use tokio::io::DuplexStream;
     use tokio::io::Lines;
     use tokio::io::duplex;
+    use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
     use tokio::time::timeout;
 
+    use super::complete_queued_client_responses;
     use super::run_connection;
     use crate::ExecServerRuntimePaths;
     use crate::ProcessId;
     use crate::connection::JsonRpcConnection;
+    use crate::connection::JsonRpcConnectionEvent;
     use crate::protocol::ENVIRONMENT_INFO_METHOD;
+    use crate::protocol::ENVIRONMENT_STATUS_METHOD;
     use crate::protocol::EXEC_METHOD;
     use crate::protocol::EXEC_READ_METHOD;
     use crate::protocol::EXEC_TERMINATE_METHOD;
     use crate::protocol::EnvironmentInfo;
+    use crate::protocol::EnvironmentStatus;
+    use crate::protocol::EnvironmentStatusKind;
     use crate::protocol::ExecParams;
     use crate::protocol::ExecResponse;
+    use crate::protocol::ExecServerNetworkPolicyDecision;
     use crate::protocol::INITIALIZE_METHOD;
     use crate::protocol::INITIALIZED_METHOD;
     use crate::protocol::InitializeParams;
     use crate::protocol::InitializeResponse;
+    use crate::protocol::NETWORK_POLICY_REQUEST_METHOD;
+    use crate::protocol::NetworkPolicyRequestResponse;
     use crate::protocol::ReadParams;
     use crate::protocol::TerminateParams;
     use crate::protocol::TerminateResponse;
+    use crate::rpc::RpcServerOutboundMessage;
+    use crate::rpc_server_requests::RpcServerRequestSender;
     use crate::server::session_registry::SessionRegistry;
 
     #[tokio::test]
+    async fn startup_prewarms_without_a_client_connection() -> anyhow::Result<()> {
+        let paths = ExecServerRuntimePaths::new(
+            std::env::current_exe()?,
+            /*codex_linux_sandbox_exe*/ None,
+        )?;
+        let directory = tempfile::tempdir()?;
+        let request = crate::discover_v2::capability_locations::CapabilityLocationRequest {
+            codex_home: PathUri::from_host_native_path(directory.path().join("codex"))?,
+            user_home: Some(PathUri::from_host_native_path(
+                directory.path().join("home"),
+            )?),
+        };
+        let skill_root = directory.path().join("codex/skills");
+        std::fs::create_dir_all(&skill_root)?;
+        let mut processor = super::ConnectionProcessor::new_with_location_request(
+            paths,
+            crate::ExecServerTelemetry::default(),
+            codex_http_client::HttpClientFactory::new(
+                codex_http_client::OutboundProxyPolicy::ReqwestDefault,
+            ),
+            crate::server::RequestDispatchMode::Inline,
+            Ok(request.clone()),
+        );
+        Arc::get_mut(&mut processor.capability_prewarm)
+            .ok_or_else(|| anyhow::anyhow!("startup task unexpectedly shared"))?
+            .await?;
+        let cloned_processor = processor.clone();
+        assert!(Arc::ptr_eq(
+            &processor.capability_manager,
+            &cloned_processor.capability_manager,
+        ));
+        let manager = &processor.capability_manager;
+        // Removing the fixture proves startup retained it before any later call.
+        std::fs::remove_dir(&skill_root)?;
+        let (first, second) = tokio::try_join!(
+            manager.prewarm_locations(request.clone()),
+            manager.prewarm_locations(request.clone()),
+        )?;
+        assert!(std::ptr::eq(first, second));
+        assert_eq!(first.0, request);
+        let expected_root = request.codex_home.join("skills")?;
+        assert!(
+            first
+                .1
+                .locations
+                .iter()
+                .any(|location| location.root == expected_root)
+        );
+        let mut different_request = request.clone();
+        different_request.codex_home = request.codex_home.join("different")?;
+        let Err(error) = manager.prewarm_locations(different_request).await else {
+            anyhow::bail!("different home paths must not reuse cached locations");
+        };
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(std::ptr::eq(
+            first,
+            manager.prewarm_locations(request).await?,
+        ));
+        processor.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn connection_accepts_pipelined_scalar_requests() {
-        let registry = SessionRegistry::new();
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
         let (mut writer, mut lines, task) = spawn_test_connection(registry, "pipelined-scalar");
 
         send_request(
@@ -248,9 +453,16 @@ mod tests {
 
         send_request(&mut writer, /*id*/ 2, ENVIRONMENT_INFO_METHOD, &()).await;
         send_request(&mut writer, /*id*/ 3, ENVIRONMENT_INFO_METHOD, &()).await;
+        send_request(&mut writer, /*id*/ 4, ENVIRONMENT_STATUS_METHOD, &()).await;
 
         let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 2).await;
         let _: EnvironmentInfo = read_response(&mut lines, /*expected_id*/ 3).await;
+        assert_eq!(
+            read_response::<EnvironmentStatus>(&mut lines, /*expected_id*/ 4).await,
+            EnvironmentStatus {
+                status: EnvironmentStatusKind::Ready,
+            }
+        );
 
         drop(writer);
         drop(lines);
@@ -260,9 +472,64 @@ mod tests {
             .expect("processor should join");
     }
 
+    /// A callback response received before EOF must survive transport shutdown.
+    #[tokio::test]
+    async fn disconnect_completes_queued_network_policy_response() {
+        let (outgoing_tx, mut outgoing_rx) = mpsc::channel(/*buffer*/ 1);
+        let requests = RpcServerRequestSender::new(outgoing_tx);
+        let pending_request = {
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                requests
+                    .call_with_timeout::<_, NetworkPolicyRequestResponse>(
+                        NETWORK_POLICY_REQUEST_METHOD,
+                        &(),
+                        Duration::from_secs(1),
+                    )
+                    .await
+            })
+        };
+        let RpcServerOutboundMessage::Request(request) = outgoing_rx
+            .recv()
+            .await
+            .expect("network policy request should be queued")
+        else {
+            panic!("expected outbound network policy request");
+        };
+
+        let (incoming_tx, mut incoming_rx) = mpsc::channel(/*buffer*/ 2);
+        incoming_tx
+            .try_send(JsonRpcConnectionEvent::Message(JSONRPCMessage::Response(
+                JSONRPCResponse {
+                    id: request.id,
+                    result: serde_json::to_value(NetworkPolicyRequestResponse {
+                        decision: ExecServerNetworkPolicyDecision::Allow,
+                    })
+                    .expect("serialize network policy response"),
+                },
+            )))
+            .expect("queue network policy response");
+        incoming_tx
+            .try_send(JsonRpcConnectionEvent::Disconnected { reason: None })
+            .expect("queue transport disconnect");
+
+        complete_queued_client_responses(&requests, &mut incoming_rx);
+        requests.close();
+
+        assert_eq!(
+            pending_request
+                .await
+                .expect("network policy request should join")
+                .expect("network policy request should complete"),
+            NetworkPolicyRequestResponse {
+                decision: ExecServerNetworkPolicyDecision::Allow,
+            }
+        );
+    }
+
     #[tokio::test]
     async fn transport_disconnect_detaches_session_during_in_flight_read() {
-        let registry = SessionRegistry::new();
+        let registry = SessionRegistry::new(crate::ExecServerTelemetry::default());
         let (mut first_writer, mut first_lines, first_task) =
             spawn_test_connection(Arc::clone(&registry), "first");
 
@@ -358,7 +625,15 @@ mod tests {
         let (server_writer, client_reader) = duplex(1 << 20);
         let connection =
             JsonRpcConnection::from_stdio(server_reader, server_writer, label.to_string());
-        let task = tokio::spawn(run_connection(connection, registry, test_runtime_paths()));
+        let task = tokio::spawn(run_connection(
+            connection,
+            super::ConnectionProcessor {
+                session_registry: registry,
+                ..super::ConnectionProcessor::new(test_runtime_paths())
+            },
+            crate::telemetry::ConnectionTransport::Stdio,
+            /*executor_registration*/ None,
+        ));
         (client_writer, BufReader::new(client_reader).lines(), task)
     }
 
@@ -430,10 +705,12 @@ mod tests {
             env.insert("PATH".to_string(), path.to_string_lossy().into_owned());
         }
         ExecParams {
+            metadata: Default::default(),
             process_id,
             argv: sleep_then_print_argv(),
             cwd: PathUri::from_host_native_path(std::env::current_dir().expect("cwd"))
                 .expect("cwd URI"),
+            shell_snapshot: None,
             env_policy: None,
             env,
             tty: false,
@@ -441,6 +718,8 @@ mod tests {
             arg0: None,
             sandbox: None,
             enforce_managed_network: false,
+            managed_network: None,
+            network_proxy: None,
         }
     }
 

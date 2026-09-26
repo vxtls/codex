@@ -1,13 +1,17 @@
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditOutcome;
 use codex_app_server_protocol::ConsumeAccountRateLimitResetCreditResponse;
 use codex_app_server_protocol::RateLimitResetCreditsSummary;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use uuid::Uuid;
 
-use super::rate_limits::get_limits_duration;
+use super::reset_credits::reset_credit_options;
 use super::*;
 
 const USAGE_MENU_VIEW_ID: &str = "usage-menu";
 const RATE_LIMIT_RESET_VIEW_ID: &str = "rate-limit-reset";
+const RATE_LIMIT_RESET_CONFIRMATION_VIEW_ID: &str = "rate-limit-reset-confirmation";
 
 impl ChatWidget {
     pub(super) fn open_usage_menu(&mut self) {
@@ -29,35 +33,30 @@ impl ChatWidget {
         let reset_eligible = self.has_chatgpt_account;
         let (reset_action_enabled, reset_description) =
             match (reset_eligible, self.available_rate_limit_reset_credits) {
-                (true, Some(available_count)) if available_count > 0 => (
-                    true,
-                    format!(
-                        "You have {available_count} {} available.",
-                        reset_label(available_count)
-                    ),
-                ),
-                (true, None) => (true, "Check reset availability.".to_string()),
-                (true, Some(_)) | (false, _) => {
-                    (false, "No usage limit resets available.".to_string())
+                (true, Some(available_count)) if available_count > 0 => {
+                    (true, format!("{available_count} available"))
                 }
+                (true, None) => (true, "Check availability".to_string()),
+                (true, Some(_)) | (false, _) => (false, "None available".to_string()),
             };
+
         SelectionViewParams {
             view_id: Some(USAGE_MENU_VIEW_ID),
             title: Some("Usage".to_string()),
-            subtitle: Some("View account usage or redeem an earned reset.".to_string()),
-            footer_hint: Some(standard_popup_hint_line()),
+            subtitle: Some("Account usage and resets.".to_string()),
+            footer_hint: Some(usage_hint_line(&self.bottom_pane.list_keymap(), "open")),
             items: vec![
                 SelectionItem {
-                    name: "Show usage".to_string(),
-                    description: Some("View recent account token usage.".to_string()),
+                    name: "View analytics".to_string(),
+                    description: Some("Usage history".to_string()),
                     actions: vec![Box::new(|tx| {
-                        tx.send(AppEvent::OpenTokenActivity);
+                        tx.send(AppEvent::OpenAnalytics { view: None });
                     })],
                     dismiss_on_select: true,
                     ..Default::default()
                 },
                 SelectionItem {
-                    name: "Redeem usage limit reset".to_string(),
+                    name: "Redeem reset".to_string(),
                     description: Some(reset_description),
                     is_disabled: !reset_action_enabled,
                     actions: vec![Box::new(|tx| {
@@ -67,7 +66,7 @@ impl ChatWidget {
                     ..Default::default()
                 },
             ],
-            ..Default::default()
+            ..SelectionViewParams::picker()
         }
     }
 
@@ -98,6 +97,8 @@ impl ChatWidget {
 
     pub(crate) fn show_rate_limit_reset_loading_popup(&mut self) -> u64 {
         self.clear_pending_rate_limit_reset_hint();
+        self.pending_rate_limit_reset_idempotency_key = None;
+        self.rate_limit_reset_picker_request_id = None;
         let request_id = self.take_next_rate_limit_reset_request_id();
         self.pending_rate_limit_reset_request_id = Some(request_id);
         self.bottom_pane.show_selection_view(SelectionViewParams {
@@ -109,7 +110,7 @@ impl ChatWidget {
                 is_disabled: true,
                 ..Default::default()
             }],
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
         self.request_redraw();
         request_id
@@ -129,82 +130,161 @@ impl ChatWidget {
             self.on_rate_limit_snapshot(Some(snapshot));
         }
 
+        let mut shows_picker = false;
         let params = match result {
             Ok(response) => {
-                self.available_rate_limit_reset_credits = Some(response.available_count);
-                if response.available_count > 0 {
-                    self.rate_limit_reset_confirmation_params(response.available_count)
+                let available_count = response.available_count;
+                let params = if available_count > 0 {
+                    shows_picker = true;
+                    self.rate_limit_reset_picker_params(request_id, &response)
                 } else {
                     Self::rate_limit_reset_message_params(
                         "You don't have any usage limit resets available.",
                     )
-                }
+                };
+                self.available_rate_limit_reset_credits = Some(available_count);
+                params
             }
-            Err(_) => Self::rate_limit_reset_message_params(
-                "Couldn't load usage limit resets. Please try again.",
-            ),
+            Err(_) => {
+                Self::reset_refresh_params("Couldn't load usage limit resets. Please try again.")
+            }
         };
         let replaced = self
             .bottom_pane
             .replace_selection_view_if_present(RATE_LIMIT_RESET_VIEW_ID, params);
+        self.rate_limit_reset_picker_request_id = (replaced && shows_picker).then_some(request_id);
         if replaced {
             self.request_redraw();
         }
         replaced
     }
 
-    fn rate_limit_reset_confirmation_params(&self, available_count: i64) -> SelectionViewParams {
-        let idempotency_key = Uuid::new_v4().to_string();
-        let has_monthly_window = self
-            .rate_limit_snapshots_by_limit_id
-            .iter()
-            .find(|(limit_id, _)| limit_id.eq_ignore_ascii_case("codex"))
+    fn rate_limit_reset_picker_params(
+        &self,
+        picker_request_id: u64,
+        reset_credits: &RateLimitResetCreditsSummary,
+    ) -> SelectionViewParams {
+        let confirmation_gate = Arc::new(AtomicBool::new(true));
+        let mut items = reset_credit_options(reset_credits, self.clock_format)
             .into_iter()
-            .flat_map(|(_, snapshot)| [snapshot.primary.as_ref(), snapshot.secondary.as_ref()])
-            .flatten()
-            .any(|window| {
-                window
-                    .window_minutes
-                    .and_then(get_limits_duration)
-                    .as_deref()
-                    == Some("monthly")
-            });
-        let reset_description = if has_monthly_window
-            || matches!(self.plan_type, Some(PlanType::Free | PlanType::Go))
-        {
-            "Reset your current monthly usage limit."
-        } else {
-            "Reset your current 5-hour and weekly usage limits."
-        };
+            .map(|option| {
+                let confirmation_gate = confirmation_gate.clone();
+                let credit_id = option.credit_id;
+                let reset_title = option.name.clone();
+                let reset_detail = option.detail;
+                let reset_description = option.description;
+                let picker_description = reset_detail
+                    .clone()
+                    .unwrap_or_else(|| reset_description.clone());
+                SelectionItem {
+                    name: option.name,
+                    description: Some(picker_description),
+                    actions: vec![Box::new(move |tx| {
+                        if confirmation_gate.swap(false, Ordering::AcqRel) {
+                            tx.send(AppEvent::OpenRateLimitResetConfirmation {
+                                picker_request_id,
+                                confirmation_gate: confirmation_gate.clone(),
+                                credit_id: credit_id.clone(),
+                                reset_title: reset_title.clone(),
+                                reset_detail: reset_detail.clone(),
+                                reset_description: reset_description.clone(),
+                            });
+                        }
+                    })],
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+        items.push(SelectionItem {
+            name: "Cancel".to_string(),
+            dismiss_on_select: true,
+            ..Default::default()
+        });
         SelectionViewParams {
             view_id: Some(RATE_LIMIT_RESET_VIEW_ID),
             title: Some("Usage limit resets".to_string()),
             subtitle: Some(format!(
-                "You have {available_count} {} available.",
-                reset_label(available_count)
+                "{} {} available.",
+                reset_credits.available_count,
+                reset_label(reset_credits.available_count)
             )),
-            footer_hint: Some(standard_popup_hint_line()),
+            footer_hint: Some(usage_hint_line(&self.bottom_pane.list_keymap(), "choose")),
+            items,
+            initial_selected_idx: Some(0),
+            ..SelectionViewParams::picker()
+        }
+    }
+
+    pub(crate) fn show_rate_limit_reset_confirmation(
+        &mut self,
+        picker_request_id: u64,
+        confirmation_gate: Arc<AtomicBool>,
+        credit_id: Option<String>,
+        reset_title: String,
+        reset_detail: Option<String>,
+        reset_description: String,
+    ) -> bool {
+        if self.rate_limit_reset_picker_request_id != Some(picker_request_id)
+            || self
+                .bottom_pane
+                .selected_index_for_active_view(RATE_LIMIT_RESET_VIEW_ID)
+                .is_none()
+        {
+            confirmation_gate.store(true, Ordering::Release);
+            return false;
+        }
+        let idempotency_key = Uuid::new_v4().to_string();
+        self.pending_rate_limit_reset_idempotency_key = Some(idempotency_key.clone());
+        let no_confirmation_gate = confirmation_gate.clone();
+        let subtitle = reset_detail.map_or_else(
+            || reset_title.clone(),
+            |reset_detail| format!("{reset_title} · {reset_detail}"),
+        );
+        self.bottom_pane.show_selection_view(SelectionViewParams {
+            view_id: Some(RATE_LIMIT_RESET_CONFIRMATION_VIEW_ID),
+            title: Some("Use this reset?".to_string()),
+            subtitle: Some(subtitle),
+            footer_hint: Some(usage_hint_line(&self.bottom_pane.list_keymap(), "confirm")),
             items: vec![
                 SelectionItem {
-                    name: "Use a reset".to_string(),
-                    description: Some(reset_description.to_string()),
+                    name: "Yes, use reset".to_string(),
+                    description: Some(reset_description),
                     actions: vec![Box::new(move |tx| {
                         tx.send(AppEvent::ConsumeRateLimitResetCredit {
                             idempotency_key: idempotency_key.clone(),
+                            credit_id: credit_id.clone(),
                         });
                     })],
                     dismiss_on_select: true,
                     ..Default::default()
                 },
                 SelectionItem {
-                    name: "Cancel".to_string(),
+                    name: "No, go back".to_string(),
+                    description: Some("Choose a different reset".to_string()),
+                    actions: vec![Box::new(move |_| {
+                        no_confirmation_gate.store(true, Ordering::Release);
+                    })],
                     dismiss_on_select: true,
                     ..Default::default()
                 },
             ],
             initial_selected_idx: Some(1),
-            ..Default::default()
+            on_cancel: Some(Box::new(move |_| {
+                confirmation_gate.store(true, Ordering::Release);
+            })),
+            ..SelectionViewParams::picker()
+        });
+        true
+    }
+
+    pub(crate) fn start_rate_limit_reset_consumption(
+        &mut self,
+        idempotency_key: &str,
+    ) -> Option<u64> {
+        if self.pending_rate_limit_reset_idempotency_key.as_deref() != Some(idempotency_key) {
+            return None;
         }
+        Some(self.show_rate_limit_reset_consuming_popup())
     }
 
     fn rate_limit_reset_message_params(message: &str) -> SelectionViewParams {
@@ -217,14 +297,44 @@ impl ChatWidget {
                 dismiss_on_select: true,
                 ..Default::default()
             }],
-            ..Default::default()
+            ..SelectionViewParams::picker()
+        }
+    }
+
+    fn reset_refresh_params(message: &str) -> SelectionViewParams {
+        SelectionViewParams {
+            view_id: Some(RATE_LIMIT_RESET_VIEW_ID),
+            title: Some("Usage limit resets".to_string()),
+            subtitle: Some(message.to_string()),
+            items: vec![
+                SelectionItem {
+                    name: "Try again".to_string(),
+                    actions: vec![Box::new(|tx| {
+                        tx.send(AppEvent::OpenRateLimitResetCredits);
+                    })],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+                SelectionItem {
+                    name: "Close".to_string(),
+                    dismiss_on_select: true,
+                    ..Default::default()
+                },
+            ],
+            ..SelectionViewParams::picker()
         }
     }
 
     pub(crate) fn show_rate_limit_reset_consuming_popup(&mut self) -> u64 {
         self.clear_pending_rate_limit_reset_hint();
+        self.pending_rate_limit_reset_idempotency_key = None;
+        self.rate_limit_reset_picker_request_id = None;
         let request_id = self.take_next_rate_limit_reset_request_id();
         self.pending_rate_limit_reset_request_id = Some(request_id);
+        self.bottom_pane
+            .dismiss_view_by_id(RATE_LIMIT_RESET_CONFIRMATION_VIEW_ID);
+        self.bottom_pane
+            .dismiss_view_by_id(RATE_LIMIT_RESET_VIEW_ID);
         self.bottom_pane.show_selection_view(SelectionViewParams {
             view_id: Some(RATE_LIMIT_RESET_VIEW_ID),
             title: Some("Usage limit resets".to_string()),
@@ -235,7 +345,7 @@ impl ChatWidget {
                 ..Default::default()
             }],
             allow_cancel: false,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         });
         self.request_redraw();
         request_id
@@ -245,6 +355,7 @@ impl ChatWidget {
         &mut self,
         request_id: u64,
         idempotency_key: String,
+        credit_id: Option<String>,
         result: Result<ConsumeAccountRateLimitResetCreditResponse, String>,
     ) -> bool {
         if self.pending_rate_limit_reset_request_id != Some(request_id) {
@@ -269,6 +380,13 @@ impl ChatWidget {
                     ConsumeAccountRateLimitResetCreditOutcome::NothingToReset => {
                         "Your usage does not need a reset right now."
                     }
+                    ConsumeAccountRateLimitResetCreditOutcome::NoCredit if credit_id.is_some() => {
+                        self.available_rate_limit_reset_credits = None;
+                        self.replace_rate_limit_reset_popup(Self::reset_refresh_params(
+                            "That reset is no longer available. Refresh to see your current resets.",
+                        ));
+                        return false;
+                    }
                     ConsumeAccountRateLimitResetCreditOutcome::NoCredit => {
                         self.available_rate_limit_reset_credits = Some(0);
                         "No usage limit resets are available."
@@ -281,6 +399,7 @@ impl ChatWidget {
             }
             Err(_) => {
                 self.pending_rate_limit_reset_request_id = None;
+                self.pending_rate_limit_reset_idempotency_key = Some(idempotency_key.clone());
                 self.replace_rate_limit_reset_popup(SelectionViewParams {
                     view_id: Some(RATE_LIMIT_RESET_VIEW_ID),
                     title: Some("Usage limit resets".to_string()),
@@ -291,6 +410,7 @@ impl ChatWidget {
                             actions: vec![Box::new(move |tx| {
                                 tx.send(AppEvent::ConsumeRateLimitResetCredit {
                                     idempotency_key: idempotency_key.clone(),
+                                    credit_id: credit_id.clone(),
                                 });
                             })],
                             dismiss_on_select: true,
@@ -302,7 +422,7 @@ impl ChatWidget {
                             ..Default::default()
                         },
                     ],
-                    ..Default::default()
+                    ..SelectionViewParams::picker()
                 });
                 false
             }
@@ -325,11 +445,11 @@ impl ChatWidget {
 
         let message = match result {
             Ok(response) => {
-                self.available_rate_limit_reset_credits = Some(response.available_count);
+                let available_count = response.available_count;
+                self.available_rate_limit_reset_credits = Some(available_count);
                 format!(
-                    "Usage reset. You have {} {} left.",
-                    response.available_count,
-                    reset_label(response.available_count)
+                    "Usage reset. You have {available_count} {} left.",
+                    reset_label(available_count)
                 )
             }
             Err(_) => "Usage reset.".to_string(),
@@ -349,7 +469,7 @@ impl ChatWidget {
                 ..Default::default()
             }],
             allow_cancel: false,
-            ..Default::default()
+            ..SelectionViewParams::picker()
         }
     }
 
@@ -386,14 +506,17 @@ impl ChatWidget {
             return false;
         }
         if let Ok(response) = result {
-            self.available_rate_limit_reset_credits = Some(response.available_count);
-            self.set_rate_limit_reset_available_hint(response.available_count);
+            let available_count = response.available_count;
+            self.available_rate_limit_reset_credits = Some(available_count);
+            self.set_rate_limit_reset_available_hint(available_count);
         }
         true
     }
 
     pub(crate) fn clear_pending_rate_limit_reset_requests(&mut self) {
         self.pending_rate_limit_reset_request_id = None;
+        self.pending_rate_limit_reset_idempotency_key = None;
+        self.rate_limit_reset_picker_request_id = None;
         self.pending_usage_menu_rate_limit_request_id = None;
         self.available_rate_limit_reset_credits = None;
         self.rate_limit_snapshots_by_limit_id.clear();
@@ -401,6 +524,8 @@ impl ChatWidget {
         self.bottom_pane.dismiss_view_by_id(USAGE_MENU_VIEW_ID);
         self.bottom_pane
             .dismiss_view_by_id(RATE_LIMIT_RESET_VIEW_ID);
+        self.bottom_pane
+            .dismiss_view_by_id(RATE_LIMIT_RESET_CONFIRMATION_VIEW_ID);
     }
 
     pub(crate) fn clear_pending_rate_limit_reset_hint(&mut self) {
@@ -444,6 +569,27 @@ impl ChatWidget {
             .wrapping_add(/*rhs*/ 1);
         request_id
     }
+}
+
+/// Keep usage actions readable on narrow terminals and honor customized list bindings.
+fn usage_hint_line(
+    keymap: &crate::keymap::ListKeymap,
+    accept_label: &'static str,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (action, label) in [
+        (crate::keymap::ListAction::Accept, accept_label),
+        (crate::keymap::ListAction::Cancel, "back"),
+    ] {
+        if let Some(hint) = keymap.primary_hint(action) {
+            if !spans.is_empty() {
+                spans.push(" · ".into());
+            }
+            spans.extend(hint.spans());
+            spans.push(format!(" {label}").into());
+        }
+    }
+    Line::from(spans)
 }
 
 fn reset_label(count: i64) -> &'static str {

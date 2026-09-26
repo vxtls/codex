@@ -6,9 +6,12 @@ use codex_protocol::protocol::GitInfo;
 use codex_protocol::protocol::SessionMeta;
 use codex_protocol::protocol::SessionMetaLine;
 use codex_protocol::protocol::SessionSource;
+use codex_protocol::protocol::ThreadHistoryMode;
+use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenCountEvent;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::protocol::TokenUsageInfo;
+use core_test_support::test_path_buf;
 use serde_json::json;
 use std::fs;
 use std::fs::FileTimes;
@@ -55,6 +58,41 @@ pub fn create_fake_rollout(
     )
 }
 
+/// Creates a minimal paginated rollout with ordinalized JSONL records.
+pub fn create_fake_paginated_rollout(
+    codex_home: &Path,
+    filename_ts: &str,
+    meta_rfc3339: &str,
+    preview: &str,
+    model_provider: Option<&str>,
+    git_info: Option<GitInfo>,
+) -> Result<String> {
+    let thread_id = create_fake_rollout(
+        codex_home,
+        filename_ts,
+        meta_rfc3339,
+        preview,
+        model_provider,
+        git_info,
+    )?;
+    let path = rollout_path(codex_home, filename_ts, &thread_id);
+    let mut lines = fs::read_to_string(path.as_path())?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    lines[0]["payload"]["history_mode"] = serde_json::to_value(ThreadHistoryMode::Paginated)?;
+    for (ordinal, line) in lines.iter_mut().enumerate() {
+        line["ordinal"] = serde_json::to_value(ordinal)?;
+    }
+    let contents = lines
+        .into_iter()
+        .map(|line| line.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(path, format!("{contents}\n"))?;
+    Ok(thread_id)
+}
+
 /// Creates a minimal rollout whose history includes a persisted token usage event.
 ///
 /// Resume and fork tests use this fixture to verify lifecycle replay of restored
@@ -81,16 +119,20 @@ pub fn create_fake_rollout_with_token_usage(
             total_token_usage: TokenUsage {
                 input_tokens: 120,
                 cached_input_tokens: 20,
+                cache_write_input_tokens: 0,
                 output_tokens: 30,
                 reasoning_output_tokens: 10,
                 total_tokens: 150,
+                codex_rollout_budget_units: None,
             },
             last_token_usage: TokenUsage {
                 input_tokens: 70,
                 cached_input_tokens: 10,
+                cache_write_input_tokens: 0,
                 output_tokens: 20,
                 reasoning_output_tokens: 5,
                 total_tokens: 90,
+                codex_rollout_budget_units: None,
             },
             model_context_window: Some(200_000),
         }),
@@ -120,6 +162,30 @@ pub fn create_fake_rollout_with_source(
     git_info: Option<GitInfo>,
     source: SessionSource,
 ) -> Result<String> {
+    create_fake_rollout_with_session_and_thread_source(
+        codex_home,
+        filename_ts,
+        meta_rfc3339,
+        preview,
+        model_provider,
+        git_info,
+        source,
+        /*thread_source*/ None,
+    )
+}
+
+/// Create a minimal rollout file with explicit session and thread sources.
+#[allow(clippy::too_many_arguments)]
+pub fn create_fake_rollout_with_session_and_thread_source(
+    codex_home: &Path,
+    filename_ts: &str,
+    meta_rfc3339: &str,
+    preview: &str,
+    model_provider: Option<&str>,
+    git_info: Option<GitInfo>,
+    source: SessionSource,
+    thread_source: Option<ThreadSource>,
+) -> Result<String> {
     create_fake_rollout_with_source_and_parent_thread_id(
         codex_home,
         filename_ts,
@@ -128,6 +194,7 @@ pub fn create_fake_rollout_with_source(
         model_provider,
         git_info,
         source,
+        thread_source,
         /*session_id*/ None,
         /*parent_thread_id*/ None,
     )
@@ -154,6 +221,7 @@ pub fn create_fake_parented_rollout_with_source(
         model_provider,
         git_info,
         source,
+        /*thread_source*/ None,
         Some(session_id),
         Some(parent_thread_id),
     )
@@ -168,6 +236,7 @@ fn create_fake_rollout_with_source_and_parent_thread_id(
     model_provider: Option<&str>,
     git_info: Option<GitInfo>,
     source: SessionSource,
+    thread_source: Option<ThreadSource>,
     session_id: Option<SessionId>,
     parent_thread_id: Option<ThreadId>,
 ) -> Result<String> {
@@ -184,24 +253,33 @@ fn create_fake_rollout_with_source_and_parent_thread_id(
 
     // Build JSONL lines
     let meta = SessionMeta {
+        creator_user_id: None,
+        creator_account_id: None,
         session_id,
         id: conversation_id,
         forked_from_id: None,
+        forked_from_ordinal_exclusive: None,
         parent_thread_id,
         timestamp: meta_rfc3339.to_string(),
-        cwd: PathBuf::from("/"),
+        cwd: test_path_buf("/"),
+        runtime_workspace_roots: None,
         originator: "codex".to_string(),
         cli_version: "0.0.0".to_string(),
         source,
-        thread_source: None,
+        thread_source,
         agent_path: None,
         agent_nickname: None,
         agent_role: None,
         model_provider: model_provider.map(str::to_string),
         base_instructions: None,
         dynamic_tools: None,
+        selected_capability_roots: Vec::new(),
         memory_mode: None,
+        history_mode: Default::default(),
+        history_base: None,
+        subagent_history_start_ordinal: None,
         multi_agent_version: None,
+        context_window: None,
     };
     let payload = serde_json::to_value(SessionMetaLine {
         meta,
@@ -271,12 +349,16 @@ pub fn create_fake_rollout_with_text_elements(
 
     // Build JSONL lines
     let meta = SessionMeta {
+        creator_user_id: None,
+        creator_account_id: None,
         session_id: conversation_id.into(),
         id: conversation_id,
         forked_from_id: None,
+        forked_from_ordinal_exclusive: None,
         parent_thread_id: None,
         timestamp: meta_rfc3339.to_string(),
-        cwd: PathBuf::from("/"),
+        cwd: test_path_buf("/"),
+        runtime_workspace_roots: None,
         originator: "codex".to_string(),
         cli_version: "0.0.0".to_string(),
         source: SessionSource::Cli,
@@ -287,8 +369,13 @@ pub fn create_fake_rollout_with_text_elements(
         model_provider: model_provider.map(str::to_string),
         base_instructions: None,
         dynamic_tools: None,
+        selected_capability_roots: Vec::new(),
         memory_mode: None,
+        history_mode: Default::default(),
+        history_base: None,
+        subagent_history_start_ordinal: None,
         multi_agent_version: None,
+        context_window: None,
     };
     let payload = serde_json::to_value(SessionMetaLine {
         meta,

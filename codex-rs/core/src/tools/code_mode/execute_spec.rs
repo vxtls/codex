@@ -1,4 +1,6 @@
+use codex_code_mode::ImageDetailVisibility;
 use codex_code_mode::ToolDefinition as CodeModeToolDefinition;
+use codex_protocol::openai_models::CodeModeToolMessages;
 use codex_tools::FreeformTool;
 use codex_tools::FreeformToolFormat;
 use codex_tools::ToolSpec;
@@ -6,9 +8,12 @@ use std::collections::BTreeMap;
 
 pub(crate) fn create_code_mode_tool(
     enabled_tools: &[CodeModeToolDefinition],
+    deferred_tools: &[CodeModeToolDefinition],
     namespace_descriptions: &BTreeMap<String, codex_code_mode::ToolNamespaceDescription>,
+    default_exec_yield_time_ms: u64,
     code_mode_only: bool,
-    deferred_tools_available: bool,
+    image_detail_visibility: ImageDetailVisibility,
+    messages: Option<&CodeModeToolMessages>,
 ) -> ToolSpec {
     const CODE_MODE_FREEFORM_GRAMMAR: &str = r#"
 start: pragma_source | plain_source
@@ -24,10 +29,14 @@ SOURCE: /[\s\S]+/
         name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
         description: codex_code_mode::build_exec_tool_description(
             enabled_tools,
+            deferred_tools,
             namespace_descriptions,
+            default_exec_yield_time_ms,
             code_mode_only,
-            deferred_tools_available,
+            image_detail_visibility,
+            messages,
         ),
+        defer_loading: None,
         format: FreeformToolFormat {
             r#type: "grammar".to_string(),
             syntax: "lark".to_string(),
@@ -50,24 +59,32 @@ mod tests {
             description: "Update the plan".to_string(),
             kind: codex_code_mode::CodeModeToolKind::Function,
             input_schema: None,
+            input_schema_max_bytes: None,
             output_schema: None,
         }];
 
         assert_eq!(
             create_code_mode_tool(
                 &enabled_tools,
+                &[],
                 &BTreeMap::new(),
+                codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS,
                 /*code_mode_only*/ true,
-                /*deferred_tools_available*/ false,
+                ImageDetailVisibility::Visible,
+                /*messages*/ None,
             ),
             ToolSpec::Freeform(FreeformTool {
                 name: codex_code_mode::PUBLIC_TOOL_NAME.to_string(),
                 description: codex_code_mode::build_exec_tool_description(
                     &enabled_tools,
+                    &[],
                     &BTreeMap::new(),
+                    codex_code_mode::DEFAULT_EXEC_YIELD_TIME_MS,
                     /*code_mode_only*/ true,
-                    /*deferred_tools_available*/ false
+                    ImageDetailVisibility::Visible,
+                    /*messages*/ None,
                 ),
+                defer_loading: None,
                 format: FreeformToolFormat {
                     r#type: "grammar".to_string(),
                     syntax: "lark".to_string(),

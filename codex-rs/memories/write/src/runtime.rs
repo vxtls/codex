@@ -1,10 +1,15 @@
+use crate::metrics::MEMORY_STORAGE_BYTES;
+use crate::workspace::memory_storage_bytes;
 use codex_core::CodexThread;
 use codex_core::ModelClient;
 use codex_core::NewThread;
 use codex_core::Prompt;
 use codex_core::ResponseEvent;
+use codex_core::StartIfIdleSubmission;
 use codex_core::StartThreadOptions;
 use codex_core::ThreadManager;
+use codex_core::TurnInputRequest;
+use codex_core::TurnStartOptions;
 use codex_core::config::Config;
 use codex_core::content_items_to_text;
 use codex_core::detached_memory_responses_metadata;
@@ -12,6 +17,7 @@ use codex_core::resolve_installation_id;
 use codex_features::Feature;
 use codex_login::AuthManager;
 use codex_login::CodexAuth;
+use codex_login::auth::AgentIdentityAuthPolicy;
 use codex_login::auth_env_telemetry::collect_auth_env_telemetry;
 use codex_login::default_client::originator;
 use codex_model_provider::ModelProvider;
@@ -19,22 +25,22 @@ use codex_model_provider::SharedModelProvider;
 use codex_model_provider::create_model_provider;
 use codex_otel::SessionTelemetry;
 use codex_otel::TelemetryAuthMode;
+use codex_protocol::MemoryVersion;
 use codex_protocol::SessionId;
 use codex_protocol::ThreadId;
 use codex_protocol::config_types::ReasoningSummary;
 use codex_protocol::openai_models::ModelInfo;
 use codex_protocol::openai_models::ReasoningEffort;
-use codex_protocol::protocol::InitialHistory;
 use codex_protocol::protocol::InternalSessionSource;
-use codex_protocol::protocol::Op;
 use codex_protocol::protocol::SessionSource;
 use codex_protocol::protocol::ThreadSource;
 use codex_protocol::protocol::TokenUsage;
 use codex_protocol::user_input::UserInput;
 use codex_rollout_trace::InferenceTraceContext;
-use codex_state::StateRuntime;
+use codex_state::MemoryStore;
 use codex_terminal_detection::user_agent;
 use futures::StreamExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,6 +51,7 @@ pub(crate) struct SpawnedConsolidationAgent {
 
 #[derive(Clone, Debug)]
 pub(crate) struct StageOneRequestContext {
+    version: MemoryVersion,
     pub(crate) model_info: ModelInfo,
     pub(crate) session_telemetry: SessionTelemetry,
     pub(crate) reasoning_effort: Option<ReasoningEffort>,
@@ -54,25 +61,77 @@ pub(crate) struct StageOneRequestContext {
 
 impl StageOneRequestContext {
     pub(crate) fn start_timer(&self, name: &str) -> Option<codex_otel::Timer> {
-        self.session_telemetry.start_timer(name, &[]).ok()
+        self.session_telemetry
+            .start_timer(name, &memory_metric_tags(self.version, &[]))
+            .ok()
     }
 
     pub(crate) fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
-        self.session_telemetry.counter(name, inc, tags);
+        self.session_telemetry
+            .counter(name, inc, &memory_metric_tags(self.version, tags));
     }
 
     pub(crate) fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) {
-        self.session_telemetry.histogram(name, value, tags);
+        self.session_telemetry
+            .histogram(name, value, &memory_metric_tags(self.version, tags));
     }
 }
 
 pub(crate) struct MemoryStartupContext {
+    version: MemoryVersion,
     thread_id: ThreadId,
     thread: Arc<CodexThread>,
     thread_manager: Arc<ThreadManager>,
     auth_manager: Arc<AuthManager>,
     provider: SharedModelProvider,
     session_telemetry: SessionTelemetry,
+}
+
+fn memory_metric_tags<'a>(
+    version: MemoryVersion,
+    tags: &[(&'a str, &'a str)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut tags = tags.to_vec();
+    tags.push((
+        "memory_version",
+        match version {
+            MemoryVersion::V1 => "v1",
+            MemoryVersion::V2 => "v2",
+        },
+    ));
+    tags
+}
+
+fn build_session_telemetry(
+    auth_manager: &AuthManager,
+    thread_id: ThreadId,
+    config: &Config,
+    source: SessionSource,
+    model: &str,
+    originator: String,
+) -> SessionTelemetry {
+    let auth = auth_manager.auth_cached();
+    let auth = auth.as_ref();
+    let auth_mode = auth.map(CodexAuth::auth_mode).map(TelemetryAuthMode::from);
+    let account_id = auth.and_then(CodexAuth::get_account_id);
+    let account_email = auth.and_then(CodexAuth::get_account_email);
+    let auth_env_telemetry = collect_auth_env_telemetry(
+        &config.model_provider,
+        auth_manager.codex_api_key_env_enabled(),
+    );
+    SessionTelemetry::new(
+        thread_id,
+        model,
+        model,
+        account_id,
+        account_email,
+        auth_mode,
+        originator,
+        config.otel.log_user_prompt,
+        user_agent(),
+        source,
+    )
+    .with_auth_env(auth_env_telemetry.to_otel_metadata())
 }
 
 impl MemoryStartupContext {
@@ -129,31 +188,18 @@ impl MemoryStartupContext {
         source: SessionSource,
         provider: SharedModelProvider,
     ) -> Self {
-        let auth = auth_manager.auth_cached();
-        let auth = auth.as_ref();
-        let auth_mode = auth.map(CodexAuth::auth_mode).map(TelemetryAuthMode::from);
-        let account_id = auth.and_then(CodexAuth::get_account_id);
-        let account_email = auth.and_then(CodexAuth::get_account_email);
         let model = config.model.as_deref().unwrap_or("unknown");
-        let auth_env_telemetry = collect_auth_env_telemetry(
-            &config.model_provider,
-            auth_manager.codex_api_key_env_enabled(),
-        );
-        let session_telemetry = SessionTelemetry::new(
+        let session_telemetry = build_session_telemetry(
+            &auth_manager,
             thread_id,
-            model,
-            model,
-            account_id,
-            account_email,
-            auth_mode,
-            originator().value,
-            config.otel.log_user_prompt,
-            user_agent(),
+            config,
             source,
-        )
-        .with_auth_env(auth_env_telemetry.to_otel_metadata());
+            model,
+            originator().value,
+        );
 
         Self {
+            version: config.memories.version,
             thread_id,
             thread,
             thread_manager,
@@ -167,8 +213,49 @@ impl MemoryStartupContext {
         self.thread_id
     }
 
-    pub(crate) fn state_db(&self) -> Option<Arc<StateRuntime>> {
-        self.thread.state_db()
+    pub(crate) async fn record_storage_size(&self, root: &Path) {
+        let bytes = match memory_storage_bytes(root).await {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                tracing::warn!("failed measuring memory storage size: {err}");
+                return;
+            }
+        };
+        self.session_telemetry.histogram_with_boundaries(
+            MEMORY_STORAGE_BYTES,
+            i64::try_from(bytes).unwrap_or(i64::MAX),
+            // Log-spaced byte buckets cover small summaries through large memory collections.
+            &[
+                0.0,
+                1_024.0,
+                4_096.0,
+                16_384.0,
+                65_536.0,
+                262_144.0,
+                1_048_576.0,
+                4_194_304.0,
+                16_777_216.0,
+                67_108_864.0,
+                268_435_456.0,
+                1_073_741_824.0,
+            ],
+            &memory_metric_tags(self.version, &[]),
+        );
+    }
+
+    pub(crate) async fn memory_store(&self) -> Option<MemoryStore> {
+        match self
+            .thread
+            .state_db()?
+            .memories_for_version(self.version)
+            .await
+        {
+            Ok(store) => Some(store),
+            Err(err) => {
+                tracing::warn!("failed opening memory store: {err}");
+                None
+            }
+        }
     }
 
     pub(crate) fn provider(&self) -> &dyn ModelProvider {
@@ -176,15 +263,19 @@ impl MemoryStartupContext {
     }
 
     pub(crate) fn counter(&self, name: &str, inc: i64, tags: &[(&str, &str)]) {
-        self.session_telemetry.counter(name, inc, tags);
+        self.session_telemetry
+            .counter(name, inc, &memory_metric_tags(self.version, tags));
     }
 
     pub(crate) fn histogram(&self, name: &str, value: i64, tags: &[(&str, &str)]) {
-        self.session_telemetry.histogram(name, value, tags);
+        self.session_telemetry
+            .histogram(name, value, &memory_metric_tags(self.version, tags));
     }
 
     pub(crate) fn start_timer(&self, name: &str) -> Option<codex_otel::Timer> {
-        self.session_telemetry.start_timer(name, &[]).ok()
+        self.session_telemetry
+            .start_timer(name, &memory_metric_tags(self.version, &[]))
+            .ok()
     }
 
     pub(crate) async fn stage_one_request_context(
@@ -204,11 +295,16 @@ impl MemoryStartupContext {
             .unwrap_or(model_info.default_reasoning_summary);
 
         StageOneRequestContext {
+            version: self.version,
             model_info,
-            session_telemetry: self
-                .session_telemetry
-                .clone()
-                .with_model(model_name, model_name),
+            session_telemetry: build_session_telemetry(
+                &self.auth_manager,
+                self.thread_id,
+                config,
+                config_snapshot.session_source,
+                model_name,
+                config_snapshot.originator,
+            ),
             reasoning_effort: Some(reasoning_effort),
             reasoning_summary,
             service_tier: config_snapshot.service_tier,
@@ -228,26 +324,35 @@ impl MemoryStartupContext {
         let session_id_string = session_id.to_string();
         let model_client = ModelClient::new(
             Some(Arc::clone(&self.auth_manager)),
+            AgentIdentityAuthPolicy::JwtOnly,
             self.thread_id,
             config.model_provider.clone(),
             session_source.clone(),
+            config_snapshot.originator,
             config.model_verbosity,
+            config.features.enabled(Feature::ContentItemKinds),
+            config.features.enabled(Feature::ReasoningEffortOverride),
             config.features.enabled(Feature::EnableRequestCompression),
             config.features.enabled(Feature::RuntimeMetrics),
             /*beta_features_header*/ None,
-            config.features.enabled(Feature::ItemIds),
+            /*concurrent_reasoning_summaries_enabled*/ false,
             /*attestation_provider*/ None,
+            config.http_client_factory(),
+            config.workspace_routing_context(),
+            Vec::new(),
         );
 
         let mut client_session = model_client.new_session();
         let window_id = format!("{}:0", self.thread_id);
         let responses_metadata = detached_memory_responses_metadata(
+            &self.thread_manager,
             installation_id,
             session_id_string,
             self.thread_id.to_string(),
             window_id,
             &session_source,
             &config.cwd,
+            &config_snapshot.permission_profile,
             /*sandbox*/ None,
         )
         .await;
@@ -295,48 +400,43 @@ impl MemoryStartupContext {
         config: Config,
         prompt: Vec<UserInput>,
     ) -> anyhow::Result<SpawnedConsolidationAgent> {
-        let environments = self
-            .thread_manager
-            .default_environment_selections(&config.cwd);
         let NewThread {
             thread_id, thread, ..
         } = self
             .thread_manager
-            .start_thread_with_options(StartThreadOptions {
-                config,
-                initial_history: InitialHistory::New,
+            .start_thread(StartThreadOptions {
                 session_source: Some(SessionSource::Internal(
                     InternalSessionSource::MemoryConsolidation,
                 )),
                 thread_source: Some(ThreadSource::MemoryConsolidation),
-                dynamic_tools: Vec::new(),
-                metrics_service_name: None,
-                multi_agent_mode: None,
-                parent_trace: None,
-                environments,
-                thread_extension_init: Default::default(),
-                supports_openai_form_elicitation: false,
+                ..StartThreadOptions::new(config)
             })
             .await?;
 
         let agent = SpawnedConsolidationAgent { thread_id, thread };
-        if let Err(err) = agent
+        let submit_result = match agent
             .thread
-            .submit(Op::UserInput {
-                items: prompt,
-                final_output_json_schema: None,
-                responsesapi_client_metadata: None,
-                additional_context: Default::default(),
-                thread_settings: Default::default(),
-            })
+            .start_turn_if_idle(
+                TurnInputRequest::user_input(prompt).on_start(TurnStartOptions {
+                    turn_trigger: Some("memory_consolidation".to_owned()),
+                    ..Default::default()
+                }),
+            )
             .await
         {
+            Ok(StartIfIdleSubmission::Started { .. }) => Ok(()),
+            Ok(submission) => Err(anyhow::anyhow!(
+                "memory consolidation input was not started: {submission:?}"
+            )),
+            Err(err) => Err(err.into()),
+        };
+        if let Err(err) = submit_result {
             if let Err(shutdown_err) = self.shutdown_consolidation_agent(agent).await {
                 tracing::warn!(
                     "failed to shut down consolidation agent after submit error: {shutdown_err}"
                 );
             }
-            return Err(err.into());
+            return Err(err);
         }
 
         Ok(agent)
@@ -347,17 +447,13 @@ impl MemoryStartupContext {
         agent: SpawnedConsolidationAgent,
     ) -> anyhow::Result<()> {
         let SpawnedConsolidationAgent { thread_id, thread } = agent;
-        let thread = self
-            .thread_manager
-            .remove_thread(&thread_id)
-            .await
-            .unwrap_or(thread);
-
         tokio::time::timeout(Duration::from_secs(10), thread.shutdown_and_wait())
             .await
             .map_err(|_| {
                 anyhow::anyhow!("memory consolidation agent {thread_id} shutdown timed out")
             })??;
+
+        self.thread_manager.remove_thread(&thread_id).await;
 
         Ok(())
     }

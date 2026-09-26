@@ -13,7 +13,7 @@ use pretty_assertions::assert_eq;
 fn client_management_handle(
     remote_control_url: String,
     auth_manager: Arc<AuthManager>,
-) -> RemoteControlHandle {
+) -> RemoteControlSession {
     let desired_state_tx = watch::channel(RemoteControlDesiredState::Disabled).0;
     let (status_tx, _status_rx) = watch::channel(RemoteControlStatusChangedNotification {
         status: RemoteControlConnectionStatus::Disabled,
@@ -21,18 +21,19 @@ fn client_management_handle(
         installation_id: TEST_INSTALLATION_ID.to_string(),
         environment_id: None,
     });
-    RemoteControlHandle {
+    RemoteControlSession {
         policy: RemoteControlPolicy::Allowed,
+        shutdown_token: CancellationToken::new(),
         desired_state_tx: Arc::new(desired_state_tx),
         desired_state_rpc_lock: Arc::new(Semaphore::new(1)),
-        desired_state_persistence_lock: Arc::new(Semaphore::new(1)),
+        persistence: RemoteControlPersistence::default(),
         status_tx: Arc::new(status_tx),
         state_db: None,
         remote_control_url,
         current_enrollment: Arc::new(RemoteControlEnrollmentState::new(/*enrollment*/ None)),
         pairing_persistence_key: watch::channel(None).0,
         pairing_persistence_key_required: false,
-        auth_manager,
+        auth_manager: auth::RemoteControlAuth::capture(auth_manager).0,
     }
 }
 
@@ -60,8 +61,8 @@ async fn remote_control_handle_lists_clients_while_disabled() {
             Some(&"Bearer Access Token".to_string())
         );
         assert_eq!(
-            request.headers.get(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
-            Some(&"account_id".to_string())
+            request.headers.get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
         );
         respond_with_json(
             request.stream,
@@ -127,6 +128,14 @@ async fn remote_control_handle_revokes_client_while_disabled() {
             request.request_line,
             "DELETE /backend-api/wham/remote/control/environments/env%20%2F%3F/clients/client%20%2F%3F HTTP/1.1"
         );
+        assert_eq!(
+            request.headers.get("authorization"),
+            Some(&"Bearer Access Token".to_string())
+        );
+        assert_eq!(
+            request.headers.get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status(request.stream, "204 No Content", "").await;
     });
     let handle = client_management_handle(remote_control_url, remote_control_auth_manager());
@@ -155,12 +164,24 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
             stale_request.headers.get("authorization"),
             Some(&"Bearer stale-token".to_string())
         );
+        assert_eq!(
+            stale_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status(stale_request.stream, "401 Unauthorized", "").await;
 
         let recovered_request = accept_http_request(&listener).await;
         assert_eq!(
             recovered_request.headers.get("authorization"),
             Some(&"Bearer fresh-token".to_string())
+        );
+        assert_eq!(
+            recovered_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
         );
         respond_with_json(recovered_request.stream, empty_client_list()).await;
     });
@@ -185,7 +206,7 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let mut fresh_auth = remote_control_auth_dot_json(Some("account_id"));
@@ -204,7 +225,7 @@ async fn list_remote_control_clients_recovers_auth_after_unauthorized() {
 
     let response = list_remote_control_clients(
         &remote_control_url,
-        &auth_manager,
+        &auth::RemoteControlAuth::capture(auth_manager.clone()).0,
         RemoteControlClientsListParams {
             environment_id: "env-123".to_string(),
             ..Default::default()
@@ -235,12 +256,24 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
             stale_request.headers.get("authorization"),
             Some(&"Bearer stale-token".to_string())
         );
+        assert_eq!(
+            stale_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status(stale_request.stream, "401 Unauthorized", "").await;
 
         let recovered_request = accept_http_request(&listener).await;
         assert_eq!(
             recovered_request.headers.get("authorization"),
             Some(&"Bearer fresh-token".to_string())
+        );
+        assert_eq!(
+            recovered_request
+                .headers
+                .get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
         );
         respond_with_status(recovered_request.stream, "401 Unauthorized", "").await;
 
@@ -271,7 +304,7 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
         /*forced_chatgpt_workspace_id*/ None,
         /*chatgpt_base_url*/ None,
         AuthKeyringBackendKind::default(),
-        /*auth_route_config*/ None,
+        codex_login::test_support::transport_default_auth_route_config(),
     )
     .await;
     let mut fresh_auth = remote_control_auth_dot_json(Some("account_id"));
@@ -290,7 +323,7 @@ async fn list_remote_control_clients_retries_unauthorized_only_once() {
 
     let err = list_remote_control_clients(
         &remote_control_url,
-        &auth_manager,
+        &auth::RemoteControlAuth::capture(auth_manager.clone()).0,
         RemoteControlClientsListParams {
             environment_id: "env-123".to_string(),
             ..Default::default()
@@ -311,6 +344,14 @@ async fn revoke_remote_control_client_does_not_retry_forbidden() {
     let remote_control_url = remote_control_url_for_listener(&listener);
     let server_task = tokio::spawn(async move {
         let request = accept_http_request(&listener).await;
+        assert_eq!(
+            request.headers.get("authorization"),
+            Some(&"Bearer Access Token".to_string())
+        );
+        assert_eq!(
+            request.headers.get_all(REMOTE_CONTROL_ACCOUNT_ID_HEADER),
+            vec!["account_id"]
+        );
         respond_with_status_and_headers(
             request.stream,
             "403 Forbidden",
@@ -322,7 +363,7 @@ async fn revoke_remote_control_client_does_not_retry_forbidden() {
 
     let err = revoke_remote_control_client(
         &remote_control_url,
-        &remote_control_auth_manager(),
+        &auth::RemoteControlAuth::capture(remote_control_auth_manager()).0,
         RemoteControlClientsRevokeParams {
             environment_id: "env-123".to_string(),
             client_id: "client-123".to_string(),
@@ -354,7 +395,7 @@ async fn list_remote_control_clients_preserves_decode_error_context() {
 
     let err = list_remote_control_clients(
         &remote_control_url,
-        &remote_control_auth_manager(),
+        &auth::RemoteControlAuth::capture(remote_control_auth_manager()).0,
         RemoteControlClientsListParams {
             environment_id: "env-123".to_string(),
             ..Default::default()

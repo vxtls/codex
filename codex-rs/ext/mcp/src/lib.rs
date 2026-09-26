@@ -7,7 +7,31 @@ use codex_extension_api::McpServerContributor;
 use codex_mcp::CODEX_APPS_MCP_SERVER_NAME;
 use codex_mcp::hosted_plugin_runtime_mcp_server_config;
 
-mod executor_plugin;
+mod cloud_plugin;
+#[cfg(test)]
+#[path = "event_stream_tests.rs"]
+mod event_stream_tests;
+mod plugin;
+mod plugin_contributor;
+mod plugin_contributor_state;
+mod plugin_providers;
+mod stream_manager;
+
+pub use codex_core_plugins::PluginListQuery;
+pub use codex_core_plugins::PluginProvider;
+pub use codex_core_plugins::PluginProviderError;
+pub use codex_core_plugins::PluginProviderFuture;
+pub use codex_core_plugins::PluginProviderResult;
+pub use plugin_contributor::install_plugin_providers;
+pub use plugin_contributor::install_plugins;
+pub use plugin_contributor_state::PluginsThreadState;
+pub use plugin_providers::PluginProviders;
+pub use stream_manager::McpEventStreamManager;
+pub use stream_manager::McpEventStreamUpdate;
+
+#[cfg(test)]
+#[path = "stream_manager_tests.rs"]
+mod stream_manager_tests;
 
 struct HostedPluginRuntimeExtension;
 
@@ -27,12 +51,13 @@ impl McpServerContributor<Config> for HostedPluginRuntimeExtension {
                 return vec![McpServerContribution::Remove { name }];
             }
 
-            vec![McpServerContribution::Set {
-                name,
+            vec![McpServerContribution::HostedApps {
                 config: Box::new(hosted_plugin_runtime_mcp_server_config(
                     &config.chatgpt_base_url,
                     config.apps_mcp_product_sku.as_deref(),
+                    context.originator(),
                 )),
+                protocol_mode: None,
             }]
         })
     }
@@ -42,19 +67,6 @@ pub fn install(builder: &mut ExtensionRegistryBuilder<Config>) {
     builder.mcp_server_contributor(std::sync::Arc::new(HostedPluginRuntimeExtension));
 }
 
-/// Installs discovery for MCP servers declared by thread-selected executor plugins.
-pub fn install_executor_plugins(
-    builder: &mut ExtensionRegistryBuilder<Config>,
-    environment_manager: std::sync::Arc<codex_exec_server::EnvironmentManager>,
-) {
-    builder.mcp_server_contributor(std::sync::Arc::new(
-        executor_plugin::SelectedExecutorPluginMcpContributor::new(environment_manager),
-    ));
-}
-
-/// Seeds the per-thread snapshot used by selected executor plugin MCP discovery.
-pub fn initialize_executor_plugin_thread_data(
-    thread_init: &mut codex_extension_api::ExtensionDataInit,
-) {
-    executor_plugin::seed_thread_state(thread_init);
-}
+#[cfg(test)]
+#[path = "lib_tests.rs"]
+mod tests;
