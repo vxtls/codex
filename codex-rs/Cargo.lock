@@ -4179,6 +4179,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tokio-tungstenite",
+ "tonic",
  "tower",
  "tracing",
  "tracing-opentelemetry",

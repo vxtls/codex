@@ -57,6 +57,7 @@ strum_macros = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net"] }
 tokio-tungstenite = { workspace = true }
+tonic = { workspace = true, features = ["tls-native-roots", "tls-ring"] }
 tower = { version = "0.5.3", features = ["util"] }
 tracing = { workspace = true }
 tracing-opentelemetry = { workspace = true }

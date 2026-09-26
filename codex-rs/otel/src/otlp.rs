@@ -3,11 +3,6 @@ use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Uri;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT;
-use opentelemetry_otlp::tonic_types::transport::Certificate as TonicCertificate;
-use opentelemetry_otlp::tonic_types::transport::Channel;
-use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
-use opentelemetry_otlp::tonic_types::transport::Endpoint;
-use opentelemetry_otlp::tonic_types::transport::Identity as TonicIdentity;
 use reqwest::Certificate as ReqwestCertificate;
 use reqwest::Identity as ReqwestIdentity;
 use reqwest::header::HeaderMap;
@@ -21,6 +16,11 @@ use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::TcpStream;
+use tonic::transport::Certificate as TonicCertificate;
+use tonic::transport::Channel;
+use tonic::transport::ClientTlsConfig;
+use tonic::transport::Endpoint;
+use tonic::transport::Identity as TonicIdentity;
 use tower::service_fn;
 
 pub(crate) fn build_header_map(headers: &std::collections::HashMap<String, String>) -> HeaderMap {
