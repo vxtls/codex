@@ -10,15 +10,16 @@ use rama_net::address::HostWithPort;
 use rama_net::address::ProxyAddress;
 use rama_net::stream::Socket;
 use rama_tcp::client::Request;
+use std::net::IpAddr;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 
 #[tokio::test]
-async fn native_resolution_supports_both_address_families() {
+async fn doh_resolution_supports_both_address_families() {
     let domain: Domain = "localhost".parse().expect("valid domain");
     let (ipv4, ipv6) = tokio::join!(
-        SystemDnsResolver.ipv4_lookup(domain.clone()),
-        SystemDnsResolver.ipv6_lookup(domain),
+        DohDnsResolver.ipv4_lookup(domain.clone()),
+        DohDnsResolver.ipv6_lookup(domain),
     );
 
     assert_eq!(
@@ -32,7 +33,7 @@ async fn native_resolution_supports_both_address_families() {
 }
 
 #[tokio::test]
-async fn connector_reaches_native_hostname_over_ipv4_and_ipv6() {
+async fn connector_reaches_doh_hostname_over_ipv4_and_ipv6() {
     for ip in [
         IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(Ipv6Addr::LOCALHOST),
@@ -57,7 +58,7 @@ async fn connector_reaches_native_hostname_over_ipv4_and_ipv6() {
 }
 
 #[tokio::test]
-async fn native_resolution_preserves_local_network_rejection() {
+async fn doh_resolution_preserves_local_network_rejection() {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .await
         .expect("bind listener");

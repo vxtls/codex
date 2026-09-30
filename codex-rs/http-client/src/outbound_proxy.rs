@@ -144,6 +144,16 @@ pub enum OutboundProxyRoute {
     },
 }
 
+impl OutboundProxyRoute {
+    /// Applies this route's `NO_PROXY` value to one concrete destination.
+    ///
+    /// Transports that open sockets themselves must call this before dialing so they do not need
+    /// to delegate proxy selection, and therefore DNS resolution, to a lower-level client.
+    pub fn materialize_no_proxy(self, request_url: &str) -> Self {
+        materialize_no_proxy_route(self, request_url)
+    }
+}
+
 impl fmt::Debug for OutboundProxyRoute {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -312,6 +322,27 @@ impl HttpClientFactory {
         }
     }
 
+    /// Resolves a WebSocket route without delegating proxy or DNS handling to Tungstenite.
+    ///
+    /// Reqwest's transport-default mode can retain its configured DoH resolver, but Tungstenite's
+    /// transport-default dialer would perform system DNS. Materialize environment proxy and
+    /// `NO_PROXY` behavior here so the shared WebSocket dialer can resolve every socket host via
+    /// DoH.
+    pub async fn resolve_websocket_proxy_route_async(
+        &self,
+        request_url: String,
+    ) -> io::Result<OutboundProxyRoute> {
+        let route = if matches!(
+            self.outbound_proxy_policy,
+            OutboundProxyPolicy::ReqwestDefault
+        ) {
+            resolve_env_proxy_route(&ProcessEnv, EnvProxyKind::from_request_url(&request_url))
+        } else {
+            self.resolve_proxy_route_async(request_url.clone()).await?
+        };
+        Ok(materialize_no_proxy_route(route, &request_url))
+    }
+
     fn cached_proxy_route(&self, request_url: &str) -> Option<OutboundProxyRoute> {
         let env_proxy_kind = EnvProxyKind::from_request_url(request_url);
         let request_url = proxy_resolution_url(request_url);
@@ -398,6 +429,31 @@ fn resolve_env_proxy_route(
             no_proxy: proxy_env_value(env, "NO_PROXY"),
         },
         None => OutboundProxyRoute::Direct,
+    }
+}
+
+fn materialize_no_proxy_route(
+    route: OutboundProxyRoute,
+    request_url: &str,
+) -> OutboundProxyRoute {
+    match route {
+        OutboundProxyRoute::Proxy {
+            url,
+            no_proxy: Some(no_proxy),
+        } => {
+            let request_url = proxy_resolution_url(request_url);
+            if RequestOrigin::parse(&request_url)
+                .is_some_and(|origin| no_proxy_matches_origin(&no_proxy, &origin))
+            {
+                OutboundProxyRoute::Direct
+            } else {
+                OutboundProxyRoute::Proxy {
+                    url,
+                    no_proxy: None,
+                }
+            }
+        }
+        route => route,
     }
 }
 
@@ -700,7 +756,6 @@ fn system_proxy_cache_key(request_url: &str) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-#[cfg(any(test, target_os = "windows"))]
 fn no_proxy_matches_origin(no_proxy: &str, origin: &RequestOrigin) -> bool {
     no_proxy
         .split(',')
@@ -709,7 +764,6 @@ fn no_proxy_matches_origin(no_proxy: &str, origin: &RequestOrigin) -> bool {
         .any(|entry| no_proxy_entry_matches_origin(entry, origin))
 }
 
-#[cfg(any(test, target_os = "windows"))]
 fn no_proxy_entry_matches_origin(entry: &str, origin: &RequestOrigin) -> bool {
     if entry == "*" {
         return true;
@@ -750,7 +804,6 @@ fn no_proxy_entry_matches_origin(entry: &str, origin: &RequestOrigin) -> bool {
     origin.host == entry
 }
 
-#[cfg(any(test, target_os = "windows"))]
 fn wildcard_host_match(pattern: &str, host: &str) -> bool {
     let mut remaining = host;
     let mut first = true;

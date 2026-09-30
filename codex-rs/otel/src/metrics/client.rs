@@ -621,13 +621,21 @@ fn build_otlp_metric_exporter(
                     })?,
                 None => base_tls_config,
             };
+            let (channel, timeout) = crate::otlp::build_grpc_channel(
+                &endpoint,
+                tls_config,
+                OTEL_EXPORTER_OTLP_METRICS_TIMEOUT,
+            )
+            .map_err(|err| MetricsError::InvalidConfig {
+                message: err.to_string(),
+            })?;
 
             opentelemetry_otlp::MetricExporter::builder()
                 .with_tonic()
-                .with_endpoint(endpoint)
+                .with_channel(channel)
+                .with_timeout(timeout)
                 .with_temporality(temporality)
                 .with_metadata(MetadataMap::from_headers(header_map))
-                .with_tls_config(tls_config)
                 .build()
                 .map_err(|source| MetricsError::ExporterBuild { source })
         }

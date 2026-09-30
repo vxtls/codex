@@ -142,6 +142,15 @@ pub enum OAuthCredentialsStoreMode {
     Keyring,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default, JsonSchema)]
+#[schemars(deny_unknown_fields)]
+pub struct NetworkingToml {
+    /// Ordered DoH server list used for all Codex-owned DNS resolution.
+    pub doh_servers: Option<Vec<String>>,
+    /// Optional JSONL file path for outbound request metadata logging.
+    pub request_log_path: Option<AbsolutePathBuf>,
+}
+
 /// Determine how auth credentials should use keyring-backed storage.
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "lowercase")]

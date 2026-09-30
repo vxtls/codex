@@ -27,7 +27,7 @@ mod socket_path;
 mod socks5;
 mod state;
 #[cfg(target_os = "macos")]
-mod system_dns;
+mod doh_dns;
 mod upstream;
 #[cfg(target_os = "windows")]
 mod windows_proxy_ingress;

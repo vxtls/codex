@@ -8,6 +8,7 @@ use opentelemetry::propagation::Injector;
 use reqwest::IntoUrl;
 use reqwest::Method;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::Span;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
@@ -164,9 +165,34 @@ impl TransportClient {
         &self,
         mut request: reqwest::Request,
     ) -> Result<reqwest::Response, reqwest::Error> {
+        let method = request.method().clone();
+        let url = request.url().to_string();
         apply_default_headers(request.headers_mut(), &self.default_headers);
         request.headers_mut().extend(trace_headers());
-        self.inner.execute(request).await
+        let start = Instant::now();
+        let result = self.inner.execute(request).await;
+        match &result {
+            Ok(response) => crate::networking::log_request_metadata(
+                "http",
+                method.as_str(),
+                &url,
+                Some(response.status().as_u16()),
+                start.elapsed(),
+                None,
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                crate::networking::log_request_metadata(
+                    "http",
+                    method.as_str(),
+                    &url,
+                    error.status().map(|status| status.as_u16()),
+                    start.elapsed(),
+                    Some(&message),
+                );
+            }
+        }
+        result
     }
 
     pub(crate) fn log_response(&self, method: &Method, url: &str, response: &reqwest::Response) {

@@ -52,6 +52,7 @@ use codex_config::types::McpServerTransportConfig;
 use codex_config::types::MemoriesConfig;
 use codex_config::types::MemoriesToml;
 use codex_config::types::ModelAvailabilityNuxConfig;
+use codex_config::types::NetworkingToml;
 use codex_config::types::Notice;
 use codex_config::types::NotificationCondition;
 use codex_config::types::NotificationMethod;
@@ -73,6 +74,7 @@ use codex_config::types::WindowsToml;
 use codex_exec_server::LOCAL_FS;
 use codex_features::Feature;
 use codex_features::FeaturesToml;
+use codex_http_client::NetworkRuntimeConfig;
 use codex_login::default_client::RESIDENCY_HEADER_NAME;
 use codex_login::test_support::auth_manager_from_optional_auth;
 use codex_model_provider::ProviderCapabilities;
@@ -229,6 +231,40 @@ async fn load_config_normalizes_relative_cwd_override() -> std::io::Result<()> {
     .await?;
 
     assert_eq!(config.cwd, expected_cwd);
+    Ok(())
+}
+
+#[test]
+fn missing_networking_uses_default_doh_servers() -> std::io::Result<()> {
+    let runtime = super::resolve_networking_runtime_config(None)?;
+
+    assert_eq!(
+        runtime,
+        NetworkRuntimeConfig {
+            doh_servers: codex_http_client::default_doh_servers(),
+            request_log_path: None,
+        }
+    );
+
+    Ok(())
+}
+
+#[test]
+fn networking_request_log_path_can_use_default_doh_servers() -> std::io::Result<()> {
+    let request_log_path = test_absolute_path("network-requests.jsonl");
+    let runtime = super::resolve_networking_runtime_config(Some(&NetworkingToml {
+        doh_servers: None,
+        request_log_path: Some(request_log_path.clone()),
+    }))?;
+
+    assert_eq!(
+        runtime,
+        NetworkRuntimeConfig {
+            doh_servers: codex_http_client::default_doh_servers(),
+            request_log_path: Some(request_log_path.into_path_buf()),
+        }
+    );
+
     Ok(())
 }
 

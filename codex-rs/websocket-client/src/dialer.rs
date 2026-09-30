@@ -7,6 +7,7 @@ use std::time::Duration;
 
 use codex_http_client::OutboundProxyRoute;
 use codex_http_client::build_rustls_client_config_with_custom_ca;
+use codex_http_client::resolve_host_with_doh;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use rustls::ClientConfig;
@@ -17,7 +18,6 @@ use tokio::time::sleep_until;
 use tokio_rustls::TlsConnector;
 use tokio_tungstenite::Connector;
 use tokio_tungstenite::client_async_tls_with_config;
-use tokio_tungstenite::connect_async_tls_with_config;
 use tokio_tungstenite::proxy::connect_via_proxy;
 use tokio_tungstenite::tungstenite::Error as WebSocketError;
 use tokio_tungstenite::tungstenite::error::TlsError;
@@ -41,58 +41,20 @@ pub(crate) async fn connect(
     tcp_nodelay: TcpNodelay,
     loopback_direct: bool,
 ) -> Result<(ConnectionInner, Response), WebSocketError> {
-    let disable_nagle = tcp_nodelay == TcpNodelay::Enabled;
+    let proxy_route = proxy_route.materialize_no_proxy(&request.uri().to_string());
     let proxy_url = match proxy_route {
-        OutboundProxyRoute::TransportDefault => {
-            // The workspace enables tokio-tungstenite's `proxy` feature, so its default dialer
-            // resolves HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, and NO_PROXY before opening the socket.
-            let (stream, response) = connect_async_tls_with_config(
-                request,
-                Some(config),
-                disable_nagle,
-                tls_config.map(Connector::Rustls),
-            )
-            .await?;
-            return Ok((ConnectionInner::Left(stream), response));
-        }
-        OutboundProxyRoute::Direct => None,
-        OutboundProxyRoute::Proxy {
-            url,
-            no_proxy: None,
-        } => Some(url),
-        OutboundProxyRoute::Proxy {
-            url,
-            no_proxy: Some(_),
-        } => {
-            // Let Tungstenite apply its complete NO_PROXY semantics. Its environment parser does
-            // not accept HTTPS proxy URLs, but that error occurs only after it decides the target
-            // is not bypassed, so retry that case through the explicit TLS-to-proxy path below.
-            match connect_async_tls_with_config(
-                request.clone(),
-                Some(config),
-                disable_nagle,
-                tls_config.clone().map(Connector::Rustls),
-            )
-            .await
-            {
-                Ok((stream, response)) => {
-                    return Ok((ConnectionInner::Left(stream), response));
-                }
-                Err(WebSocketError::Url(UrlError::UnsupportedProxyScheme)) => Some(url),
-                Err(error) => return Err(error),
-            }
-        }
+        OutboundProxyRoute::TransportDefault | OutboundProxyRoute::Direct => None,
+        OutboundProxyRoute::Proxy { url, .. } => Some(url),
     };
 
     let stream: Box<dyn AsyncIo> = match proxy_url {
         None => {
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            let address = host_port(host, port);
             let stream = if loopback_direct {
-                connect_loopback_tcp(address, tcp_nodelay).await
+                connect_loopback_tcp(host, port, tcp_nodelay).await
             } else {
-                connect_tcp(address, tcp_nodelay).await
+                connect_tcp(host, port, tcp_nodelay).await
             }
             .map_err(WebSocketError::Io)?;
             Box::new(stream)
@@ -101,7 +63,7 @@ pub(crate) async fn connect(
             let proxy = ProxyEndpoint::parse(&url)?;
             let host = websocket_host(&request)?;
             let port = websocket_port(&request)?;
-            let stream = connect_tcp(proxy.config.authority(), tcp_nodelay)
+            let stream = connect_tcp(&proxy.config.host, proxy.port, tcp_nodelay)
                 .await
                 .map_err(WebSocketError::Io)?;
             let stream: Box<dyn AsyncIo> = if proxy.tls {
@@ -138,18 +100,19 @@ pub(crate) async fn connect(
 struct ProxyEndpoint {
     config: ProxyConfig,
     tls: bool,
+    port: u16,
 }
 
 impl ProxyEndpoint {
     fn parse(url: &str) -> Result<Self, WebSocketError> {
         let mut parsed_url = url::Url::parse(url).map_err(|_| invalid_proxy_config())?;
         let tls = parsed_url.scheme() == "https";
+        let port = parsed_url
+            .port_or_known_default()
+            .ok_or_else(invalid_proxy_config)?;
         if tls {
             // Capture the HTTPS default before changing schemes: `Url` normalizes default ports,
             // so setting 443 before rewriting to HTTP would discard it and later imply port 80.
-            let port = parsed_url
-                .port_or_known_default()
-                .ok_or_else(invalid_proxy_config)?;
             parsed_url
                 .set_scheme("http")
                 .map_err(|_| invalid_proxy_config())?;
@@ -161,7 +124,7 @@ impl ProxyEndpoint {
             WebSocketError::Url(UrlError::UnsupportedProxyScheme) => error,
             _ => invalid_proxy_config(),
         })?;
-        Ok(Self { config, tls })
+        Ok(Self { config, tls, port })
     }
 }
 
@@ -188,21 +151,17 @@ fn websocket_port(request: &Request) -> Result<u16, WebSocketError> {
         .ok_or(WebSocketError::Url(UrlError::UnsupportedUrlScheme))
 }
 
-fn host_port(host: &str, port: u16) -> String {
-    if host.contains(':') && !host.starts_with('[') {
-        format!("[{host}]:{port}")
-    } else {
-        format!("{host}:{port}")
-    }
-}
-
-async fn connect_tcp(address: String, tcp_nodelay: TcpNodelay) -> io::Result<TcpStream> {
-    let addresses = tokio::net::lookup_host(address).await?.collect::<Vec<_>>();
+async fn connect_tcp(host: &str, port: u16, tcp_nodelay: TcpNodelay) -> io::Result<TcpStream> {
+    let addresses = resolve_host_with_doh(host, port).await?;
     connect_resolved_tcp(addresses, tcp_nodelay).await
 }
 
-async fn connect_loopback_tcp(address: String, tcp_nodelay: TcpNodelay) -> io::Result<TcpStream> {
-    let addresses = tokio::net::lookup_host(address).await?.collect::<Vec<_>>();
+async fn connect_loopback_tcp(
+    host: &str,
+    port: u16,
+    tcp_nodelay: TcpNodelay,
+) -> io::Result<TcpStream> {
+    let addresses = resolve_host_with_doh(host, port).await?;
     connect_resolved_tcp(loopback_addresses(addresses)?, tcp_nodelay).await
 }
 

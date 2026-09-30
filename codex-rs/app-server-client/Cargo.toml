@@ -20,10 +20,11 @@ codex-config = { workspace = true }
 codex-core = { workspace = true }
 codex-exec-server = { workspace = true }
 codex-feedback = { workspace = true }
+codex-http-client = { workspace = true }
 codex-protocol = { workspace = true }
 codex-uds = { workspace = true }
 codex-utils-absolute-path = { workspace = true }
-codex-utils-rustls-provider = { workspace = true }
+codex-websocket-client = { workspace = true }
 futures = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

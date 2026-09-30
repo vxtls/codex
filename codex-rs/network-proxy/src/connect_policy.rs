@@ -1,8 +1,7 @@
 use crate::policy::is_non_public_ip;
 use crate::runtime::HostBlockDecision;
 use crate::state::NetworkProxyState;
-#[cfg(target_os = "macos")]
-use crate::system_dns::SystemDnsResolver;
+use crate::doh_dns::DohDnsResolver;
 use rama_core::Service;
 use rama_core::error::BoxError;
 use rama_core::error::ErrorExt as _;
@@ -41,8 +40,7 @@ where
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
         let connector = TcpConnector::new();
-        #[cfg(target_os = "macos")]
-        let connector = connector.with_dns(SystemDnsResolver);
+        let connector = connector.with_dns(DohDnsResolver);
 
         if input.extensions().get::<ProxyAddress>().is_some() {
             return connector.serve(input).await;

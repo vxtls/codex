@@ -121,7 +121,7 @@ impl WebSocketConnector {
     ) -> Result<(WebSocketConnection, Response), WebSocketError> {
         let route = self
             .http_client_factory
-            .resolve_proxy_route_async(request.uri().to_string());
+            .resolve_websocket_proxy_route_async(request.uri().to_string());
         self.connect_with_route(request, config, route, /*loopback_direct*/ false)
             .await
     }
@@ -156,6 +156,8 @@ impl WebSocketConnector {
         loopback_direct: bool,
     ) -> Result<(WebSocketConnection, Response), WebSocketError> {
         let uri = request.uri().clone();
+        let request_url = uri.to_string();
+        let start = std::time::Instant::now();
         let url = url::Url::parse(&uri.to_string()).map_err(|_| {
             WebSocketError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -184,6 +186,27 @@ impl WebSocketConnector {
             )
             .boxed()
             .await;
+            match &result {
+                Ok((_, response)) => codex_http_client::log_request_metadata(
+                    "ws",
+                    "GET",
+                    &request_url,
+                    Some(response.status().as_u16()),
+                    start.elapsed(),
+                    None,
+                ),
+                Err(error) => {
+                    let message = error.to_string();
+                    codex_http_client::log_request_metadata(
+                        "ws",
+                        "GET",
+                        &request_url,
+                        None,
+                        start.elapsed(),
+                        Some(&message),
+                    );
+                }
+            }
             // Like HTTP responses, rejected upgrades can also refresh infrastructure cookies.
             match &result {
                 Ok((_, response)) => self

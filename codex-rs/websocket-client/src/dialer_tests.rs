@@ -318,6 +318,7 @@ fn https_proxy_defaults_to_port_443_and_preserves_explicit_port() {
                 auth: None,
             },
             tls: true,
+            port: 443,
         }
     );
     assert_eq!(
@@ -330,6 +331,7 @@ fn https_proxy_defaults_to_port_443_and_preserves_explicit_port() {
                 auth: None,
             },
             tls: true,
+            port: 8443,
         }
     );
 }

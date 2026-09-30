@@ -22,6 +22,7 @@ use crate::state::build_config_state;
 use crate::state::validate_policy_against_constraints;
 use anyhow::Context;
 use anyhow::Result;
+use codex_http_client::resolve_host_with_doh;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use globset::GlobSet;
 use opentelemetry::trace::SpanContext;
@@ -39,7 +40,6 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 use time::OffsetDateTime;
-use tokio::net::lookup_host;
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 use tracing::debug;
@@ -764,11 +764,7 @@ impl NetworkProxyState {
                 host_str,
                 port,
                 DNS_LOOKUP_TIMEOUT,
-                |host, port| async move {
-                    lookup_host((host.as_str(), port))
-                        .await
-                        .map(Iterator::collect)
-                },
+                |host, port| async move { resolve_host_with_doh(host.as_str(), port).await },
             )
             .await
             {

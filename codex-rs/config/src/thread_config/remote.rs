@@ -3,11 +3,17 @@ use std::collections::HashMap;
 use std::num::NonZeroU64;
 use std::time::Duration;
 
+use codex_http_client::resolve_host_with_doh;
 use codex_model_provider_info::ModelProviderInfo;
 use codex_model_provider_info::WireApi;
 use codex_protocol::config_types::ModelProviderAuthInfo;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use codex_utils_redacted_string::RedactedString;
+use hyper_util::rt::TokioIo;
+use tokio::net::TcpStream;
+use tonic::codegen::http::Uri;
+use tonic::transport::Endpoint;
+use tower::service_fn;
 
 use super::SessionThreadConfig;
 use super::ThreadConfigContext;
@@ -40,7 +46,38 @@ impl RemoteThreadConfigLoader {
     async fn client(
         &self,
     ) -> Result<ThreadConfigLoaderClient<tonic::transport::Channel>, ThreadConfigLoadError> {
-        ThreadConfigLoaderClient::connect(self.endpoint.clone())
+        let endpoint = Endpoint::from_shared(self.endpoint.clone())
+            .map_err(|err| {
+                ThreadConfigLoadError::new(
+                    ThreadConfigLoadErrorCode::RequestFailed,
+                    /*status_code*/ None,
+                    format!("invalid remote thread config loader endpoint: {err}"),
+                )
+            })?
+            .connect_timeout(REMOTE_THREAD_CONFIG_LOAD_TIMEOUT);
+        let channel = endpoint
+            .connect_with_connector(service_fn(|uri: Uri| async move {
+                let host = uri.host().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "remote thread config loader endpoint is missing a host",
+                    )
+                })?;
+                let port = uri.port_u16().or_else(|| match uri.scheme_str() {
+                    Some("http") => Some(80),
+                    Some("https") => Some(443),
+                    _ => None,
+                });
+                let port = port.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "remote thread config loader endpoint is missing a port",
+                    )
+                })?;
+                let addresses = resolve_host_with_doh(host, port).await?;
+                let stream = TcpStream::connect(addresses.as_slice()).await?;
+                Ok::<_, std::io::Error>(TokioIo::new(stream))
+            }))
             .await
             .map_err(|err| {
                 ThreadConfigLoadError::new(
@@ -48,7 +85,8 @@ impl RemoteThreadConfigLoader {
                     /*status_code*/ None,
                     format!("failed to connect to remote thread config loader: {err}"),
                 )
-            })
+            })?;
+        Ok(ThreadConfigLoaderClient::new(channel))
     }
 
     async fn load(

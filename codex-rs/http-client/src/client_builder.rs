@@ -208,7 +208,10 @@ impl HttpClientBuilder {
             route,
         )?;
         let inner = if explicit_roots {
-            builder
+            crate::networking::apply_doh_resolver(builder)
+                .map_err(|detail| {
+                    BuildCustomCaTransportError::ConfigureDohResolver { detail }
+                })?
                 .build()
                 .map_err(BuildRouteAwareHttpClientError::ExplicitTls)?
         } else {
@@ -322,15 +325,21 @@ impl HttpClientBuilder {
                     "HTTP client fell back to system root certificates"
                 );
                 tracing::warn!(error = %error, "failed to build HTTP client with custom CA");
-                self.reqwest_builder(proxy_routing)
+                crate::networking::apply_doh_resolver_or_fail_closed(
+                    self.reqwest_builder(proxy_routing),
+                )
+                .build()
+                .unwrap_or_else(|fallback_error| {
+                    tracing::warn!(
+                        error = %fallback_error,
+                        "failed to build fallback HTTP client"
+                    );
+                    crate::networking::apply_doh_resolver_or_fail_closed(
+                        reqwest::Client::builder(),
+                    )
                     .build()
-                    .unwrap_or_else(|fallback_error| {
-                        tracing::warn!(
-                            error = %fallback_error,
-                            "failed to build fallback HTTP client"
-                        );
-                        reqwest::Client::new()
-                    })
+                    .expect("minimal fail-closed HTTP client configuration must build")
+                })
             }
         };
         TransportClient::new(inner, request_logging, default_headers)

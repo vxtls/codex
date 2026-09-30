@@ -469,12 +469,17 @@ fn build_logger(
                 Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)?,
                 None => base_tls_config,
             };
+            let (channel, timeout) = crate::otlp::build_grpc_channel(
+                &endpoint,
+                tls_config,
+                OTEL_EXPORTER_OTLP_LOGS_TIMEOUT,
+            )?;
 
             let exporter = LogExporter::builder()
                 .with_tonic()
-                .with_endpoint(endpoint)
+                .with_channel(channel)
+                .with_timeout(timeout)
                 .with_metadata(MetadataMap::from_headers(header_map))
-                .with_tls_config(tls_config)
                 .build()?;
 
             builder = builder.with_batch_exporter(crate::network_policy::PolicyExporter {
@@ -551,12 +556,17 @@ fn build_tracer_provider(
                 Some(tls) => crate::otlp::build_grpc_tls_config(&endpoint, base_tls_config, tls)?,
                 None => base_tls_config,
             };
+            let (channel, timeout) = crate::otlp::build_grpc_channel(
+                &endpoint,
+                tls_config,
+                OTEL_EXPORTER_OTLP_TRACES_TIMEOUT,
+            )?;
 
             SpanExporter::builder()
                 .with_tonic()
-                .with_endpoint(endpoint)
+                .with_channel(channel)
+                .with_timeout(timeout)
                 .with_metadata(MetadataMap::from_headers(header_map))
-                .with_tls_config(tls_config)
                 .build()?
         }
         OtelExporter::OtlpHttp {

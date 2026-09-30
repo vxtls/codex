@@ -45,6 +45,7 @@ use codex_config::types::History;
 use codex_config::types::McpServerConfig;
 use codex_config::types::McpServerDisabledReason;
 use codex_config::types::MemoriesConfig;
+use codex_config::types::NetworkingToml;
 use codex_config::types::ModelAvailabilityNuxConfig;
 use codex_config::types::Notice;
 use codex_config::types::OAuthCredentialsStoreMode;
@@ -79,6 +80,7 @@ use codex_features::SleepToolMode;
 use codex_features::TokenBudgetConfigToml;
 use codex_git_utils::resolve_root_git_project_for_trust;
 use codex_http_client::HttpClientFactory;
+use codex_http_client::NetworkRuntimeConfig;
 use codex_http_client::OutboundProxyPolicy;
 use codex_install_context::InstallContext;
 use codex_login::AuthManagerConfig;
@@ -2761,6 +2763,44 @@ fn resolve_code_mode_config(config_toml: &ConfigToml) -> CodeModeConfig {
     }
 }
 
+fn resolve_networking_runtime_config(
+    networking: Option<&NetworkingToml>,
+) -> std::io::Result<NetworkRuntimeConfig> {
+    let Some(networking) = networking else {
+        return Ok(NetworkRuntimeConfig {
+            doh_servers: codex_http_client::default_doh_servers(),
+            request_log_path: None,
+        });
+    };
+
+    let doh_servers = networking
+        .doh_servers
+        .as_ref()
+        .map(|doh_servers| {
+            doh_servers
+                .iter()
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(codex_http_client::default_doh_servers);
+    if doh_servers.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "`networking.doh_servers` must contain at least one URL",
+        ));
+    }
+
+    Ok(NetworkRuntimeConfig {
+        doh_servers,
+        request_log_path: networking
+            .request_log_path
+            .as_ref()
+            .map(AbsolutePathBuf::to_path_buf),
+    })
+}
+
 fn resolve_multi_agent_v2_config(config_toml: &ConfigToml) -> MultiAgentV2Config {
     let base = multi_agent_v2_toml_config(config_toml.features.as_ref());
     let max_concurrent_threads_per_session = base
@@ -4077,6 +4117,14 @@ impl Config {
 
         let check_for_update_on_startup = cfg.check_for_update_on_startup.unwrap_or(true);
         let model_catalog = load_model_catalog(cfg.model_catalog_json.clone())?;
+        let networking_runtime_config =
+            resolve_networking_runtime_config(cfg.networking.as_ref())?;
+        codex_http_client::configure_networking(networking_runtime_config).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid networking config: {error}"),
+            )
+        })?;
 
         let log_dir = cfg
             .log_dir

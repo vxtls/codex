@@ -1,11 +1,9 @@
 use crate::config::OtelTlsConfig;
 use codex_utils_absolute_path::AbsolutePathBuf;
 use http::Uri;
+use hyper_util::rt::TokioIo;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT;
 use opentelemetry_otlp::OTEL_EXPORTER_OTLP_TIMEOUT_DEFAULT;
-use opentelemetry_otlp::tonic_types::transport::Certificate as TonicCertificate;
-use opentelemetry_otlp::tonic_types::transport::ClientTlsConfig;
-use opentelemetry_otlp::tonic_types::transport::Identity as TonicIdentity;
 use reqwest::Certificate as ReqwestCertificate;
 use reqwest::Identity as ReqwestIdentity;
 use reqwest::header::HeaderMap;
@@ -18,6 +16,13 @@ use std::io;
 use std::io::ErrorKind;
 use std::path::PathBuf;
 use std::time::Duration;
+use tokio::net::TcpStream;
+use tonic::transport::Certificate as TonicCertificate;
+use tonic::transport::Channel;
+use tonic::transport::ClientTlsConfig;
+use tonic::transport::Endpoint;
+use tonic::transport::Identity as TonicIdentity;
+use tower::service_fn;
 
 pub(crate) fn build_header_map(headers: &std::collections::HashMap<String, String>) -> HeaderMap {
     let mut header_map = HeaderMap::new();
@@ -65,6 +70,35 @@ pub(crate) fn build_grpc_tls_config(
     }
 
     Ok(config)
+}
+
+pub(crate) fn build_grpc_channel(
+    endpoint: &str,
+    tls_config: ClientTlsConfig,
+    timeout_var: &str,
+) -> Result<(Channel, Duration), Box<dyn Error>> {
+    let timeout = resolve_otlp_timeout(timeout_var);
+    let endpoint = Endpoint::from_shared(endpoint.to_string())?
+        .connect_timeout(timeout)
+        .timeout(timeout)
+        .tls_config(tls_config)?;
+    let channel = endpoint.connect_with_connector_lazy(service_fn(|uri: Uri| async move {
+        let host = uri
+            .host()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "OTLP endpoint has no host"))?;
+        let port = uri.port_u16().or_else(|| match uri.scheme_str() {
+            Some("http") => Some(80),
+            Some("https") => Some(443),
+            _ => None,
+        });
+        let port = port.ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidInput, "OTLP endpoint has no known port")
+        })?;
+        let addresses = codex_http_client::resolve_host_with_doh(host, port).await?;
+        let stream = TcpStream::connect(addresses.as_slice()).await?;
+        Ok::<_, io::Error>(TokioIo::new(stream))
+    }));
+    Ok((channel, timeout))
 }
 
 /// Build a blocking HTTP client with TLS configuration for OTLP HTTP exporters.
@@ -140,7 +174,8 @@ fn build_http_client_inner(
         (None, None) => {}
     }
 
-    builder
+    codex_http_client::apply_doh_resolver_blocking(builder)
+        .map_err(config_error)?
         .build()
         .map_err(|error| Box::new(error) as Box<dyn Error>)
 }

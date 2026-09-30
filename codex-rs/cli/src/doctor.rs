@@ -2460,9 +2460,8 @@ fn auth_mode_name(auth: &CodexAuth) -> &'static str {
 }
 
 async fn dns_address_family_details(host: &str, port: u16) -> Vec<String> {
-    match tokio::net::lookup_host((host, port)).await {
+    match codex_http_client::resolve_host_with_doh(host, port).await {
         Ok(addresses) => {
-            let addresses = addresses.collect::<Vec<_>>();
             let ipv4_count = addresses
                 .iter()
                 .filter(|address| matches!(address.ip(), IpAddr::V4(_)))

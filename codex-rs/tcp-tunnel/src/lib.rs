@@ -279,7 +279,9 @@ impl ProxyConnection {
     async fn connect(target: &ProxyTarget, config: &quinn::ClientConfig) -> Result<Self> {
         tokio::time::timeout(PROXY_CONNECT_TIMEOUT, async {
             let mut last_error = "MASQUE proxy resolved to no addresses".to_owned();
-            for peer in tokio::net::lookup_host((target.host.as_str(), target.port)).await? {
+            for peer in
+                codex_http_client::resolve_host_with_doh(target.host.as_str(), target.port).await?
+            {
                 let bind = match peer.ip() {
                     IpAddr::V4(_) => "0.0.0.0:0",
                     IpAddr::V6(_) => "[::]:0",

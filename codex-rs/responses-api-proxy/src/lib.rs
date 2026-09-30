@@ -99,10 +99,11 @@ pub fn run_main(args: Args) -> Result<()> {
     }
     let server = Server::from_listener(listener, None)
         .map_err(|err| anyhow!("creating HTTP server: {err}"))?;
+    // Disable reqwest's 30s default so long-lived response streams keep flowing.
+    let client_builder = Client::builder().timeout(None::<Duration>);
     let client = Arc::new(
-        Client::builder()
-            // Disable reqwest's 30s default so long-lived response streams keep flowing.
-            .timeout(None::<Duration>)
+        codex_http_client::apply_doh_resolver_blocking(client_builder)
+            .map_err(|detail| anyhow!("configuring DoH resolver: {detail}"))?
             .build()
             .context("building reqwest client")?,
     );
