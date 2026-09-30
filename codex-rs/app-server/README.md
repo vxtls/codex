@@ -1,3 +1,12 @@
+# Guardian circuit-breaker errors
+
+Set `auto_review.circuit_break_action = "strict"` to include `TooManyDenials` in
+`TurnAborted.error` when Guardian reaches its denial limit. App-server exposes it
+as `turn.error.codexErrorInfo = "tooManyDenials"` in notifications and history.
+
+The default, `"default"`, leaves this error unset. Both modes preserve the warning,
+denial limit, and interrupted status; neither emits a separate `Error` event.
+
 # Model catalog provider requirements
 
 `model/list` and periodic model catalog refreshes check the startup provider against
@@ -10,8 +19,9 @@ and caching behavior remain in effect while the provider satisfies current requi
 # MCP App UI
 
 `mcpToolCall.mcpAppUi` records the invoked descriptor's `resourceUri`
-and `preferredModelDisplayMode` (`inline` or `fullscreen`). Descriptors with a widget
-URI default to `inline` when the preference is missing or unsupported. The
+and explicit `preferredModelDisplayMode` (`inline` or `fullscreen`). Missing or
+unsupported preferences leave `mcpAppUi` unset; `mcpAppResourceUri` retains the URI
+so clients can apply resource display defaults. The
 UI information is preserved in tool-call events and saved history so clients can
 render without waiting for the full MCP catalog.
 
@@ -312,6 +322,12 @@ This is the server's advertised MCP capabilities object, including its `extensio
 map. It is null when the connection has not initialized successfully; capabilities
 are never inferred from tools or copied from a shared catalog cache.
 
+Pass `serverName` to discover only that server. With `threadId`, the request
+reuses the thread's current MCP connection and tool catalog after any pending
+runtime refresh; discovery then waits only for that server. Without `threadId`,
+discovery creates a connection for the selected server. An unknown name returns an empty page.
+Omitting `serverName` preserves full-inventory discovery.
+
 # MCP OAuth login
 
 `mcpServer/oauth/login` only returns HTTP(S) authorization URLs. Authorization
@@ -327,6 +343,23 @@ Existing rollouts may contain historical `ThreadRolledBack` events. Their replay
 and migration remain supported so resuming, reading, and forking those threads
 preserves the surviving history. This disk compatibility does not require restoring
 support for new `thread/rollback` requests.
+
+# MCP configuration reload
+
+`config/mcpServer/reload` returns an error when a loaded thread rejects the
+refreshed enterprise policy. The rejected thread retains its previous configuration
+layers with enterprise MCP disabled. Other planned thread refreshes are processed
+before the rejection is reported, so an error does not imply that no changes were
+applied. Correct the policy before retrying the reload.
+
+# Enterprise sign-in
+
+Call `mcpServer/oauth/login` with a directly configured server's `name` and its
+connected `threadId`. Open the returned `authorizationUrl` and match
+`mcpServer/oauthLogin/completed` by `loginId`. Starting another enterprise sign-in
+cancels the previous attempt and waits for its callback listener to close. Use
+`account/login/cancel` to cancel explicitly. Start a fresh session after success to
+use the saved grant.
 
 # Selected workspace routing
 

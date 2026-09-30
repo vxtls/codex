@@ -1,5 +1,6 @@
 use super::mcp_refresh::McpRefreshInvalidationGuard;
 use super::*;
+use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::environment_selection::combine_selected_capability_roots;
 use codex_exec_server::ExecutorCapabilityDiscoveryCache;
 use codex_exec_server::ExecutorCapabilityDiscoverySnapshot;
@@ -147,19 +148,33 @@ impl Session {
             .project_selected_environment_mcp_servers(config, &environments, mcp_projection)
             .await
             .config;
+        let runtime_context = self.mcp_runtime_context(&environments, &host_fallback_cwd);
+        (mcp_config, runtime_context)
+    }
+
+    pub(crate) async fn current_mcp_runtime_context(&self) -> McpRuntimeContext {
+        let host_fallback_cwd = self.state.lock().await.session_configuration.cwd().clone();
+        let environments = self.services.turn_environments.snapshot().await;
+        self.mcp_runtime_context(&environments, &host_fallback_cwd)
+    }
+
+    fn mcp_runtime_context(
+        &self,
+        environments: &TurnEnvironmentSnapshot,
+        host_fallback_cwd: &std::path::Path,
+    ) -> McpRuntimeContext {
         let local_process_cwd = environments
             .local_environment_cwd()
             .map(|cwd| cwd.to_path_buf())
             .unwrap_or_else(|| host_fallback_cwd.to_path_buf());
-        let runtime_context = McpRuntimeContext::new(
+        McpRuntimeContext::new(
             self.services.turn_environments.environment_manager(),
             local_process_cwd,
         )
         .with_selected_environments(
-            environment_selections.into(),
+            environments.all_selections().into(),
             environments.ready_environment_handles(),
-        );
-        (mcp_config, runtime_context)
+        )
     }
 
     pub(crate) async fn runtime_mcp_servers(
@@ -404,12 +419,6 @@ impl Session {
         ready_selected_capability_roots: &[SelectedCapabilityRoot],
         environments: &TurnEnvironmentSnapshot,
     ) -> Option<Arc<ExecutorCapabilityDiscoverySnapshot>> {
-        // Capability roots can currently be selected independently of turn environments, so a
-        // root may be ready when there is no primary `TurnEnvironment`. Keep using the thread
-        // policy in that case so restricted discovery fails closed below. Once every selected
-        // root belongs to a thread/environment attachment whose `EnvironmentConfig` is installed
-        // before the root becomes ready, discovery can use the root owner's policy and this
-        // fallback can be removed.
         let restricted_file_system = environments.primary().map_or_else(
             || {
                 !config
@@ -484,6 +493,7 @@ impl Session {
         &self,
         environments: &TurnEnvironmentSnapshot,
     ) -> Vec<ResolvedSelectedCapabilityRoot> {
+        let captured_environments = environments.captured_environments();
         let thread_root_count = self.services.selected_capability_roots.len();
         let mut root_locations_by_id = HashMap::new();
         let mut selected_capability_roots = Vec::new();
@@ -500,6 +510,16 @@ impl Session {
             }),
         );
         for (index, root) in combined_roots.into_iter().enumerate() {
+            let CapabilityRootLocation::Environment { environment_id, .. } = &root.location;
+            // Filter before readiness resolution, which can reconnect a historical executor.
+            if !captured_environments.contains_key(environment_id) {
+                tracing::warn!(
+                    root_id = root.id,
+                    environment_id,
+                    "ignoring capability root without a captured turn environment"
+                );
+                continue;
+            }
             if let Some(kept_location) = root_locations_by_id.get(&root.id) {
                 if kept_location != &root.location {
                     tracing::warn!(
@@ -527,10 +547,7 @@ impl Session {
         self.services
             .turn_environments
             .environment_manager()
-            .resolve_selected_capability_roots(
-                &selected_capability_roots,
-                &environments.captured_environments(),
-            )
+            .resolve_selected_capability_roots(&selected_capability_roots, &captured_environments)
             .await
     }
 

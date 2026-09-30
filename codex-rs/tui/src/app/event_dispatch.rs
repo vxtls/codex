@@ -50,8 +50,6 @@ impl App {
                     | AppEvent::ResetTranscriptForThreadSwitch
                     | AppEvent::ResetTranscriptForThreadSwitchPreservingScreen
                     | AppEvent::FinishPromptRevert { .. }
-                    | AppEvent::PromptSuggestionStarted { .. }
-                    | AppEvent::PromptSuggestionFinished { .. }
                     | AppEvent::ManagedWorktreeCreated(_)
                     | AppEvent::AgentsOverviewWorktreeCreated(_)
                     | AppEvent::AppendMessageHistoryEntry { .. }
@@ -151,7 +149,7 @@ impl App {
             AppEvent::PluginMentionsLoaded { ref cwd, .. }
                 if cwds_differ(cwd, self.config.cwd.as_path()) => {}
             AppEvent::NewSession { name } => {
-                self.start_fresh_session_with_summary_hint(
+                self.start_fresh_session(
                     tui, app_server, /*session_start_source*/ None,
                     /*initial_user_message*/ None, name,
                 )
@@ -391,7 +389,7 @@ impl App {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();
 
-                self.start_fresh_session_with_summary_hint(
+                self.start_fresh_session(
                     tui,
                     app_server,
                     Some(ThreadStartSource::Clear),
@@ -411,7 +409,7 @@ impl App {
                 self.clear_terminal_ui(tui, /*redraw_header*/ false)?;
                 self.reset_app_ui_state_after_clear();
 
-                self.start_fresh_session_with_summary_hint(
+                self.start_fresh_session(
                     tui,
                     app_server,
                     Some(ThreadStartSource::Clear),
@@ -531,6 +529,7 @@ impl App {
                             &self.chat_widget.config_ref().workspace_roots,
                         );
                     }
+                    fork_config.model_provider_id.clone_from(&self.chat_widget.config_ref().model_provider_id);
                     fork_config.model = Some(self.chat_widget.current_model().to_string());
                     fork_config.model_reasoning_effort =
                         self.chat_widget.current_reasoning_effort();
@@ -576,7 +575,7 @@ impl App {
                             {
                                 Ok(()) => {
                                     // Keep local input without replacing the fork's running state.
-                                    self.chat_widget.restore_reconnected_input(retained_input);
+                                    self.chat_widget.restore_reconnected_input(retained_input, &[]);
                                     if let Some(err) = name_error {
                                         self.chat_widget.add_error_message(err);
                                     }
@@ -833,6 +832,10 @@ impl App {
             }
             AppEvent::InsertHistoryCell(cell) => {
                 self.insert_history_cell(tui, cell);
+            }
+            AppEvent::TurnTipReady { thread_id, turn_id } => {
+                self.turn_tips.ready(thread_id, &turn_id, self.transcript_cells.last());
+                tui.frame_requester().schedule_frame();
             }
             AppEvent::EndInitialHistoryReplayBuffer => {
                 self.scrollback_has_older_history = self
@@ -1530,6 +1533,81 @@ impl App {
             }
             AppEvent::FetchMcpInventory { detail, thread_id } => {
                 self.fetch_mcp_inventory(app_server, detail, thread_id);
+            }
+            AppEvent::StartMcpLogin { name, thread_id } => {
+                if self.pending_mcp_login_start.is_some() {
+                    self.chat_widget.add_info_message(
+                        "MCP sign-in is starting. Wait for it to finish before trying again.".to_string(),
+                        /*hint*/ None,
+                    );
+                    return Ok(AppRunControl::Continue);
+                }
+                let request_id = format!("mcp-login-{}", uuid::Uuid::new_v4());
+                self.pending_mcp_login_start = Some(PendingMcpLoginStart {
+                    request_id: request_id.clone(),
+                    name: name.clone(),
+                    thread_id,
+                    completions: Vec::new(),
+                });
+                self.start_mcp_login(app_server, request_id, name, thread_id);
+            }
+            AppEvent::McpLoginStarted { request_id, result } => {
+                if let Some(pending) = self
+                    .pending_mcp_login_start
+                    .take_if(|pending| pending.request_id == request_id)
+                {
+                    match result {
+                        Ok(response) => {
+                            // Track the latest attempt per server: unrelated OAuth logins can
+                            // remain open while a user retries this server.
+                            if let Some(login_id) = response.login_id.as_ref() {
+                                self.active_mcp_login_ids
+                                    .insert(pending.name.clone(), login_id.clone());
+                            }
+                            let completed = pending.completions.iter().any(|completion| {
+                                completion.login_id == response.login_id
+                                    && completion.name == pending.name
+                            });
+                            if !completed {
+                                self.open_url_in_browser(response.authorization_url);
+                            }
+                        }
+                        Err(error) => {
+                            self.enqueue_thread_notification(
+                                pending.thread_id,
+                                ServerNotification::McpServerOauthLoginCompleted(
+                                    codex_app_server_protocol::McpServerOauthLoginCompletedNotification {
+                                        name: pending.name,
+                                        thread_id: Some(pending.thread_id.to_string()),
+                                        login_id: None,
+                                        success: false,
+                                        error: Some(error),
+                                    },
+                                ),
+                            ).await?;
+                        }
+                    }
+                    // A rejected start leaves the old attempt current. A successful replacement
+                    // has changed its ID, so the old cancellation is discarded here.
+                    for completion in pending.completions {
+                        if completion.login_id.is_some() {
+                            if completion.login_id.as_ref()
+                                != self.active_mcp_login_ids.get(&completion.name)
+                            {
+                                continue;
+                            }
+                            self.active_mcp_login_ids.remove(&completion.name);
+                        }
+                        if let Some(thread_id) = completion.thread_id.as_deref()
+                            .and_then(|id| ThreadId::from_string(id).ok())
+                        {
+                            self.enqueue_thread_notification(
+                                thread_id,
+                                ServerNotification::McpServerOauthLoginCompleted(completion),
+                            ).await?;
+                        }
+                    }
+                }
             }
             AppEvent::McpInventoryLoaded {
                 result,
@@ -2460,6 +2538,7 @@ impl App {
                         .add_error_message(format!("Failed to set permission profile: {err}"));
                     return Ok(AppRunControl::Continue);
                 }
+                self.runtime_approvals_reviewer_override = Some(self.config.approvals_reviewer);
                 self.runtime_permission_profile_override =
                     Some(RuntimePermissionProfileOverride::from_config(&self.config));
                 self.sync_active_thread_permission_settings_to_cached_session()
@@ -2473,11 +2552,9 @@ impl App {
                 if self.reject_pending_permission_change() {
                     return Ok(AppRunControl::Continue);
                 }
+                self.runtime_approvals_reviewer_override = Some(policy);
                 self.config.approvals_reviewer = policy;
                 self.chat_widget.set_approvals_reviewer(policy);
-                if let Some(profile) = self.runtime_permission_profile_override.as_mut() {
-                    profile.approvals_reviewer = policy;
-                }
                 self.sync_active_thread_permission_settings_to_cached_session()
                     .await;
                 if let Err(err) = crate::config_update::write_config_batch(
@@ -2596,6 +2673,7 @@ impl App {
                 }
             }
             AppEvent::OpenAgentsOverview => self.open_agents_overview(app_server),
+            AppEvent::ShowMoreAgentsOverview => self.show_more_agents_overview(app_server),
             AppEvent::NewAgentsOverviewSession { cwd } => {
                 return Box::pin(self.new_agents_overview_session(tui, app_server, cwd)).await;
             }
@@ -2656,19 +2734,6 @@ impl App {
             } => {
                 self.suggest_thread_name(app_server, thread_id, request_id)
                     .await;
-            }
-            AppEvent::GeneratePromptSuggestion(request) => {
-                self.generate_prompt_suggestion(app_server, request);
-            }
-            AppEvent::PromptSuggestionStarted { request, result } => {
-                self.on_prompt_suggestion_started(app_server, request, result);
-            }
-            AppEvent::PromptSuggestionFinished { request, temporary_thread_id, text } => {
-                self.temporary_structured_requests.remove(&temporary_thread_id);
-                if text.is_none() {
-                    request.cancellation.cancel();
-                }
-                self.chat_widget.apply_prompt_suggestion(&request, text);
             }
             AppEvent::ThreadTitleStarted {
                 cancellation,

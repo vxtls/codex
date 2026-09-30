@@ -666,6 +666,7 @@
             "serverOverloaded",
             "cyberPolicy",
             "misalignmentPolicyViolation",
+            "tooManyDenials",
             "internalServerError",
             "unauthorized",
             "badRequest",
@@ -2785,6 +2786,13 @@
     "McpServerOauthLoginCompletedNotification": {
       "properties": {
         "error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "loginId": {
+          "description": "Identifies the explicit login attempt. Older servers omit this field.",
           "type": [
             "string",
             "null"
@@ -6292,7 +6300,7 @@
               "type": "null"
             }
           ],
-          "description": "Only populated when the Turn's status is failed."
+          "description": "Error associated with a failed or interrupted turn."
         },
         "id": {
           "description": "Identifier for this turn. Codex-generated turn IDs are UUIDv7.",

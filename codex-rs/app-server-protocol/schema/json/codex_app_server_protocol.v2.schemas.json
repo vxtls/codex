@@ -4273,6 +4273,7 @@
             "serverOverloaded",
             "cyberPolicy",
             "misalignmentPolicyViolation",
+            "tooManyDenials",
             "internalServerError",
             "unauthorized",
             "badRequest",
@@ -9970,6 +9971,13 @@
             "null"
           ]
         },
+        "serverName": {
+          "description": "Limit discovery to one server. With a thread ID, reuse that thread's MCP connection.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "threadId": {
           "type": [
             "string",
@@ -10862,6 +10870,13 @@
             "null"
           ]
         },
+        "loginId": {
+          "description": "Identifies the explicit login attempt. Older servers omit this field.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
         "name": {
           "type": "string"
         },
@@ -10933,6 +10948,14 @@
       "properties": {
         "authorizationUrl": {
           "type": "string"
+        },
+        "loginId": {
+          "default": null,
+          "description": "Identifies this login attempt across the response and completion notification. Older servers omit this field; current servers always return it.",
+          "type": [
+            "string",
+            "null"
+          ]
         }
       },
       "required": [
@@ -22948,7 +22971,7 @@
               "type": "null"
             }
           ],
-          "description": "Only populated when the Turn's status is failed."
+          "description": "Error associated with a failed or interrupted turn."
         },
         "id": {
           "description": "Identifier for this turn. Codex-generated turn IDs are UUIDv7.",

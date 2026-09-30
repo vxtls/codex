@@ -78,6 +78,7 @@ impl App {
                 }
                 self.agents_overview.request_id = None;
                 self.agents_overview.refresh_pending = false;
+                self.agents_overview.initialized = false;
                 self.agents_overview.refresh_notifications.clear();
                 self.agents_overview.activity.clear();
                 self.agents_overview.last_messages.clear();
@@ -119,31 +120,6 @@ impl App {
         app_server_client: &AppServerSession,
         notification: ServerNotification,
     ) {
-        if let ServerNotification::ThreadStarted(started) = &notification
-            && started.thread.ephemeral
-            && matches!(started.thread.thread_source.as_ref(), Some(ThreadSource::Feature(source)) if source == "prompt_suggestion")
-            && let Ok(id) = ThreadId::from_string(&started.thread.id)
-        {
-            self.hidden_prompt_threads.push_back(id);
-            if self.hidden_prompt_threads.len() > 32 {
-                self.hidden_prompt_threads.pop_front();
-            }
-            return;
-        }
-        if let ServerNotificationThreadTarget::Thread(id) =
-            server_notification_thread_target(&notification)
-            && self.hidden_prompt_threads.contains(&id)
-        {
-            if let Some(sender) = self.temporary_structured_requests.get(&id)
-                && matches!(
-                    &notification,
-                    ServerNotification::ItemCompleted(_) | ServerNotification::TurnCompleted(_)
-                )
-            {
-                let _ = sender.send(notification);
-            }
-            return;
-        }
         // A picker can leave an old runtime's close notification queued while the same thread
         // is resumed. Thread IDs survive reloads, so confirm that the displayed thread is still
         // unloaded before routing a close that would exit the TUI or switch away from it.
@@ -245,6 +221,18 @@ impl App {
                 .or_default();
         }
         self.track_agents_overview_notification(&notification);
+        // Retained blank sessions stay subscribed after their event channels are cleared.
+        if let ServerNotification::ThreadSettingsUpdated(settings) = &notification
+            && let Ok(thread_id) = ThreadId::from_string(&settings.thread_id)
+            && self.agents_overview.blank_sessions.contains_key(&thread_id)
+            && !self.thread_event_channels.contains_key(&thread_id)
+        {
+            self.apply_thread_settings_to_cached_session(thread_id, &settings.thread_settings)
+                .await;
+            if let Some(input) = self.agents_overview.input_states.get_mut(&thread_id) {
+                input.pending_thread_settings = Some(settings.clone());
+            }
+        }
         if matches!(
             &notification,
             ServerNotification::ThreadStarted(_)
@@ -290,6 +278,25 @@ impl App {
             ServerNotification::McpServerStatusUpdated(_) => {
                 self.refresh_mcp_startup_expected_servers_from_config();
             }
+            ServerNotification::McpServerOauthLoginCompleted(notification) => {
+                // The start response identifies the new attempt. Hold completions until then
+                // so a replacement's cancellation cannot appear as a fresh login failure.
+                if let Some(pending) = self.pending_mcp_login_start.as_mut()
+                    && pending.name == notification.name
+                {
+                    pending.completions.push(notification.clone());
+                    return;
+                }
+                if notification.login_id.is_some() {
+                    if notification.login_id.as_ref()
+                        != self.active_mcp_login_ids.get(&notification.name)
+                    {
+                        return;
+                    }
+                    self.active_mcp_login_ids.remove(&notification.name);
+                }
+            }
+
             ServerNotification::AccountRateLimitsUpdated(notification) => {
                 let workspace_hard_stop = matches!(
                     notification.rate_limits.rate_limit_reached_type,
@@ -542,18 +549,6 @@ impl App {
         app_server_client: &AppServerSession,
         request: ServerRequest,
     ) {
-        if server_request_thread_id(&request)
-            .is_some_and(|id| self.hidden_prompt_threads.contains(&id))
-        {
-            let _ = self
-                .reject_app_server_request(
-                    app_server_client,
-                    request.id().clone(),
-                    "Prompt suggestions cannot request user interaction".to_string(),
-                )
-                .await;
-            return;
-        }
         if let ServerRequest::DynamicToolCall { request_id, params } = &request {
             if self.dynamic_tool_tasks.contains_key(request_id)
                 || (params.namespace.as_deref() != Some(crate::dynamic_tools::NAMESPACE)

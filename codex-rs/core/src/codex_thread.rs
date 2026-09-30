@@ -9,6 +9,7 @@ use crate::session::SessionSettingsUpdate;
 use crate::session::Submission;
 use crate::session::new_submission_id;
 use crate::session::session::Session;
+use crate::session::startup_prewarm::PrewarmInput;
 use crate::session::step_settings::StepSettingsUpdate;
 use crate::thread_startup_metadata::ThreadStartupMetadata;
 use codex_diagnostics::Gauge;
@@ -160,6 +161,18 @@ pub struct CodexThreadSettingsOverrides {
     pub disabled_plugin_ids: Option<Vec<String>>,
 }
 
+/// Result of publishing a loaded configuration snapshot for a thread.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[must_use]
+pub enum ConfigRefreshOutcome {
+    /// The resolved configuration was published.
+    Published,
+    /// The captured owner changed; the caller must reload before retrying.
+    Stale,
+    /// Resolution failed and a configuration disabling enterprise MCP was published.
+    Rejected,
+}
+
 pub use codex_guardian_context::GuardianRootMessage;
 
 /// Authorization state that changes on genuine user input or history resets.
@@ -179,6 +192,8 @@ pub struct GuardianRootSnapshot {
     /// Distinguishes a history reset from additional authorization in the same history.
     pub(crate) history_reset_version: u64,
     pub authorization_version: GuardianAuthorizationVersion,
+    /// Confirmed assistant context is relevant to review but cannot authorize an action.
+    pub review_context_revision: u64,
     pub messages: Vec<GuardianRootMessage>,
     pub trusted_skill_paths: Vec<String>,
 }
@@ -246,7 +261,18 @@ impl CodexThread {
     /// The next turn consumes the warmup through the existing startup handoff.
     /// Call after installing host services such as the thread's attestation routing.
     pub async fn prewarm(&self) {
-        self.session.schedule_startup_prewarm().await;
+        self.session
+            .schedule_startup_prewarm(PrewarmInput::Base)
+            .await;
+    }
+
+    /// Schedule an idle-thread warmup with existing history when the connection needs preparation.
+    /// Sends `generate: false`; the next turn reuses the prepared response only if its prompt
+    /// still extends this history and its request settings match. Uses the same handoff as `prewarm`.
+    pub async fn prewarm_with_history(&self) {
+        self.session
+            .schedule_startup_prewarm(PrewarmInput::History)
+            .await;
     }
 
     /// Whether analytics is enabled for this thread after configuration and host overrides.
@@ -971,14 +997,36 @@ impl CodexThread {
 
     /// Refresh the thread's layer-backed user config state from a caller-supplied
     /// config snapshot. Thread-scoped layers and session-static settings remain
-    /// unchanged.
-    pub async fn refresh_runtime_config(&self, next_config: crate::config::Config) {
-        self.session.refresh_runtime_config(next_config).await;
+    /// unchanged. A stale owner requires reloading from the current config before retrying.
+    pub async fn refresh_runtime_config(
+        &self,
+        expected_config: Arc<crate::config::Config>,
+        next_config: crate::config::Config,
+    ) -> ConfigRefreshOutcome {
+        Box::pin(
+            self.session
+                .refresh_runtime_config(expected_config, next_config),
+        )
+        .await
+    }
+
+    /// Revokes enterprise MCP authority from the current owner after a failed reload.
+    pub async fn disable_mcp_enterprise_auth(&self) {
+        self.session.disable_mcp_enterprise_auth().await;
     }
 
     /// Refresh MCP configuration and managed requirements without reloading unrelated settings.
-    pub async fn refresh_mcp_config(&self, next_config: crate::config::Config) {
-        self.session.refresh_mcp_config(next_config).await;
+    /// A stale owner requires reloading from the current config before retrying.
+    pub async fn refresh_mcp_config(
+        &self,
+        expected_config: Arc<crate::config::Config>,
+        next_config: crate::config::Config,
+    ) -> ConfigRefreshOutcome {
+        Box::pin(
+            self.session
+                .refresh_mcp_config(expected_config, next_config),
+        )
+        .await
     }
 
     /// Refreshes this thread's Apps tools before returning their runtime state.
@@ -1030,6 +1078,24 @@ impl CodexThread {
             .await?;
 
         Ok(serde_json::to_value(result)?)
+    }
+
+    /// Inspects one server through this thread's current MCP connection.
+    pub async fn mcp_server_status_snapshot(
+        &self,
+        server: &str,
+        detail: codex_mcp::McpSnapshotDetail,
+    ) -> anyhow::Result<(
+        Arc<codex_mcp::McpConfig>,
+        codex_mcp::McpServerStatusSnapshot,
+    )> {
+        self.session.refresh_mcp_if_dirty().await;
+        let runtime_context = self.session.current_mcp_runtime_context().await;
+        self.session
+            .services
+            .mcp_runtime
+            .server_status_snapshot(server, detail, &runtime_context)
+            .await
     }
 
     /// Reads an app resource using the current authority of its originating tool call.

@@ -390,6 +390,24 @@
     },
     "AutoReviewToml": {
       "properties": {
+        "circuit_break_action": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/CircuitBreakAction"
+            }
+          ],
+          "description": "Controls whether circuit-breaker interruptions include a structured error. Strict mode writes structured errors that older clients may not recognize when reading shared history. Defaults to `default`."
+        },
+        "conversation_history_max_output_tokens": {
+          "description": "Maximum estimated tokens per Guardian history-tool response, before the standard serialization allowance. Defaults to 4,000; stricter parent tool limits still apply.",
+          "format": "uint",
+          "minimum": 1.0,
+          "type": "integer"
+        },
+        "experimental_conversation_history_prompt": {
+          "description": "Experimental replacement for the history-retrieval instructions when history tools and Apps are enabled. Omitted or blank values use the built-in prompt.",
+          "type": "string"
+        },
         "experimental_policy_template": {
           "description": "Experimental full Guardian prompt template containing the tenant policy placeholder.",
           "type": "string"
@@ -508,6 +526,24 @@
         }
       },
       "type": "object"
+    },
+    "CircuitBreakAction": {
+      "oneOf": [
+        {
+          "description": "Emit the warning and interrupt without structured error details.",
+          "enum": [
+            "default"
+          ],
+          "type": "string"
+        },
+        {
+          "description": "Emit the same warning and interruption, with structured error details.",
+          "enum": [
+            "strict"
+          ],
+          "type": "string"
+        }
+      ]
     },
     "CloudToml": {
       "additionalProperties": false,
@@ -849,6 +885,9 @@
             "guardian_approval": {
               "type": "boolean"
             },
+            "guardian_conversation_history_tools": {
+              "type": "boolean"
+            },
             "guardian_enhanced_node_repl_transcripts": {
               "type": "boolean"
             },
@@ -859,6 +898,9 @@
               "type": "boolean"
             },
             "guardian_reuse_parent_compaction": {
+              "type": "boolean"
+            },
+            "guardian_root_handoff_context": {
               "type": "boolean"
             },
             "guardianv2": {
@@ -2672,7 +2714,7 @@
         },
         "requires_openai_auth": {
           "default": false,
-          "description": "Does this provider require an OpenAI API Key or ChatGPT login token? If true, user is presented with login screen on first run, and login preference and token/key are stored in auth.json. If false (which is the default), login screen is skipped, and API key (if needed) comes from the \"env_key\" environment variable.",
+          "description": "Does this provider require an OpenAI API key or ChatGPT login token? If true, the user is presented with a login screen on first run, and credentials are stored using the backend selected by `cli_auth_credentials_store`. If false (the default), the login screen is skipped, and the API key (if needed) comes from the environment variable specified by `env_key`.",
           "type": "boolean"
         },
         "stream_idle_timeout_ms": {
@@ -2752,6 +2794,14 @@
         "message_board_in_memory": {
           "description": "Keep the message board in memory for a training session, including ephemeral sessions.",
           "type": "boolean"
+        },
+        "message_board_remote": {
+          "allOf": [
+            {
+              "$ref": "#/definitions/RemoteMessageBoardConfigToml"
+            }
+          ],
+          "description": "Use a session-scoped remote board instead of local storage."
         },
         "min_wait_timeout_ms": {
           "format": "int64",
@@ -3496,14 +3546,6 @@
           },
           "type": "array"
         },
-        "ema_auth": {
-          "allOf": [
-            {
-              "$ref": "#/definitions/PluginMcpServerEmaAuthConfig"
-            }
-          ],
-          "description": "Host-configured EMA registration; the plugin still owns its endpoint."
-        },
         "enabled": {
           "default": true,
           "description": "When `false`, Codex skips initializing this plugin MCP server.",
@@ -3524,39 +3566,6 @@
           "type": "object"
         }
       },
-      "type": "object"
-    },
-    "PluginMcpServerEmaAuthConfig": {
-      "additionalProperties": false,
-      "description": "Resource registration applied through an existing per-plugin policy overlay. The enterprise IdP is selected separately by trusted host configuration.",
-      "properties": {
-        "authorization_server_issuer": {
-          "type": "string"
-        },
-        "client_id": {
-          "type": "string"
-        },
-        "resource": {
-          "type": "string"
-        },
-        "scopes": {
-          "default": [],
-          "items": {
-            "type": "string"
-          },
-          "type": "array"
-        },
-        "url": {
-          "description": "Exact plugin endpoint approved by the host; never overrides the declaration.",
-          "type": "string"
-        }
-      },
-      "required": [
-        "authorization_server_issuer",
-        "client_id",
-        "resource",
-        "url"
-      ],
       "type": "object"
     },
     "ProfileTui": {
@@ -3861,6 +3870,27 @@
           "type": "string"
         }
       ]
+    },
+    "RemoteMessageBoardConfigToml": {
+      "additionalProperties": false,
+      "description": "Connection to a board provisioned by the research host.",
+      "properties": {
+        "bearer_token": {
+          "description": "Board credential supplied directly by a runtime config override.",
+          "type": "string"
+        },
+        "bearer_token_env_var": {
+          "description": "Read the credential from this environment variable instead of bearer_token.",
+          "type": "string"
+        },
+        "url": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "url"
+      ],
+      "type": "object"
     },
     "ResumeCwdMode": {
       "description": "Working directory to use when resuming or forking a session.",
@@ -4383,7 +4413,7 @@
             }
           ],
           "default": "auto",
-          "description": "Copy selected transcript text when the mouse button is released. Defaults to `auto`: enabled in tmux/Zellij and in direct macOS terminals except Ghostty/Kitty. On other platforms, direct terminals default off except iTerm2/Terminal.app."
+          "description": "Copy selected transcript text when the mouse button is released. Defaults to `auto`: enabled except in direct terminals known to forward their native copy shortcut (Ghostty 1.2+, Kitty on macOS, Windows Terminal, and VS Code on Windows). Unknown terminals, Ghostty without a recognized version, and tmux/Zellij default to copying."
         },
         "disable_paste_burst": {
           "description": "When true, disables burst-paste detection for typed input entirely. All characters are inserted as they are received, and no buffering or placeholder replacement will occur for fast keypress bursts. Overrides the legacy top-level `disable_paste_burst` setting. Defaults to `false`.",
@@ -4647,11 +4677,6 @@
           ],
           "default": "composer",
           "description": "Where the terminal pet should anchor vertically.\n\nDefaults to `composer`, which follows the current TUI composer viewport."
-        },
-        "prompt_suggestions": {
-          "default": false,
-          "description": "Suggest a next message after successful turns. Defaults to `false`.",
-          "type": "boolean"
         },
         "question_esc_back": {
           "default": true,
@@ -6905,6 +6930,9 @@
         "guardian_approval": {
           "type": "boolean"
         },
+        "guardian_conversation_history_tools": {
+          "type": "boolean"
+        },
         "guardian_enhanced_node_repl_transcripts": {
           "type": "boolean"
         },
@@ -6915,6 +6943,9 @@
           "type": "boolean"
         },
         "guardian_reuse_parent_compaction": {
+          "type": "boolean"
+        },
+        "guardian_root_handoff_context": {
           "type": "boolean"
         },
         "guardianv2": {

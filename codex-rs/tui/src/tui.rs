@@ -70,6 +70,7 @@ mod input_boundary;
 #[cfg(unix)]
 mod job_control;
 mod keyboard_modes;
+mod link_pointer;
 #[cfg(test)]
 #[path = "tui/owned_screen_tests.rs"]
 mod owned_screen_tests;
@@ -629,11 +630,12 @@ pub enum TuiEvent {
     FocusLost,
 }
 
-/// The overlay requesting pointer reports; ordinary pickers retain alternate-scroll input.
+/// The current screen's pointer policy; ordinary pickers retain alternate-scroll input.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum OverlayInput {
     #[default]
     Default,
+    Onboarding,
     Transcript,
     StaticPager,
     Usage,
@@ -643,13 +645,14 @@ impl OverlayInput {
     fn captures_mouse(self, owned_screen: bool) -> bool {
         match self {
             Self::Default => owned_screen,
-            Self::StaticPager => false,
+            Self::Onboarding | Self::StaticPager => false,
             Self::Transcript | Self::Usage => true,
         }
     }
 }
 
 pub struct Tui {
+    pub(crate) link_hover: link_pointer::LinkHover,
     frame_requester: FrameRequester,
     draw_tx: broadcast::Sender<()>,
     event_broker: Arc<EventBroker>,
@@ -676,7 +679,7 @@ pub struct Tui {
     alt_screen_enabled: bool,
     // Keep the alternate screen alive when an overlay closes.
     owned_screen: bool,
-    overlay_input: OverlayInput,
+    pub(crate) overlay_input: OverlayInput,
     // Copies and native ownership survive closing an overlay or startup picker.
     pub(crate) clipboard: crate::clipboard_copy::worker::ClipboardWorker,
     // Keeps unmanaged process stderr writes out of the inline viewport.
@@ -726,6 +729,7 @@ impl Tui {
         );
 
         Self {
+            link_hover: link_pointer::LinkHover::default(),
             frame_requester,
             draw_tx,
             event_broker: Arc::new(event_broker),
@@ -854,6 +858,7 @@ impl Tui {
 
     // Drop crossterm EventStream to avoid stdin conflicts with other processes.
     pub fn pause_events(&mut self) {
+        self.link_hover.mouse = None;
         self.event_broker.pause_events();
     }
 

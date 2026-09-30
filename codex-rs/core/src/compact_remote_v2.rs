@@ -428,7 +428,7 @@ async fn run_remote_compaction_request_v2(
                     err,
                     client_session,
                     sess,
-                    turn_context,
+                    step_context,
                     ResponsesStreamRequest::RemoteCompactionV2,
                 )
                 .await?;
@@ -845,6 +845,7 @@ mod tests {
         drop(tx_event);
         ResponseStream {
             rx_event,
+            interrupt: None,
             consumer_dropped: CancellationToken::new(),
         }
     }

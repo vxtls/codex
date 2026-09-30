@@ -1306,30 +1306,6 @@ impl BottomPane {
 
     // esc_backtrack_hint_visible removed; hints are controlled internally.
 
-    pub(crate) fn set_prompt_suggestion(
-        &mut self,
-        request: crate::prompt_suggestions::SuggestionRequest,
-    ) {
-        self.composer.set_prompt_suggestion(request);
-    }
-
-    pub(crate) fn has_prompt_suggestion(&self) -> bool {
-        self.composer.has_prompt_suggestion()
-    }
-
-    pub(crate) fn clear_prompt_suggestion(&mut self) {
-        self.composer.clear_prompt_suggestion();
-    }
-
-    pub(crate) fn apply_prompt_suggestion(
-        &mut self,
-        request: &crate::prompt_suggestions::SuggestionRequest,
-        text: Option<String>,
-    ) {
-        self.composer.apply_prompt_suggestion(request, text);
-        self.request_redraw();
-    }
-
     pub fn set_task_running(&mut self, running: bool) {
         let was_running = self.is_task_running;
         self.is_task_running = running;
@@ -2248,6 +2224,12 @@ impl BottomPane {
                 || self.hook_status_message.is_some()
                 || !self.unified_exec_footer.is_empty();
             let has_inline_previews = has_pending_thread_approvals || has_pending_input;
+            if !has_inline_previews
+                && self.status_widget().is_some()
+                && let Some(tip) = options.working_tip
+            {
+                flex.push(/*flex*/ 1, RenderableItem::Borrowed(tip));
+            }
             if has_inline_previews && has_status_or_footer {
                 flex.push(/*flex*/ 0, RenderableItem::Owned("".into()));
             }

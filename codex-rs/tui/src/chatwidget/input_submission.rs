@@ -76,7 +76,6 @@ impl ChatWidget {
     }
 
     pub(super) fn submit_user_message(&mut self, user_message: UserMessage) {
-        self.clear_prompt_suggestion();
         let _accepted = self.submit_user_message_with_history_record(
             user_message,
             UserMessageHistoryRecord::UserMessageText,
@@ -490,6 +489,7 @@ impl ChatWidget {
         self.note_realtime_typed_input(&submitted_message.text);
         if render_in_history {
             self.input_queue.user_turn_pending_start = true;
+            self.input_queue.pending_user_message_client_id = Some(client_user_message_id.clone());
         }
 
         // Persist the submitted text to cross-session message history. Mentions are encoded into

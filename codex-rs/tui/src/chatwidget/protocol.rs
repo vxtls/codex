@@ -44,6 +44,20 @@ impl ChatWidget {
             self.restore_retry_status_header_if_present();
         }
         match notification {
+            ServerNotification::McpServerOauthLoginCompleted(notification) => {
+                if notification.success {
+                    self.add_info_message(
+                        format!("Signed in to {}.", notification.name),
+                        /*hint*/ None,
+                    );
+                } else {
+                    self.add_error_message(
+                        notification
+                            .error
+                            .unwrap_or_else(|| "MCP sign-in failed.".to_string()),
+                    );
+                }
+            }
             ServerNotification::ThreadTokenUsageUpdated(notification) => {
                 self.set_token_info(Some(token_usage_info_from_app_server(
                     notification.token_usage,
@@ -73,7 +87,6 @@ impl ChatWidget {
                 self.on_thread_settings_updated(notification);
             }
             ServerNotification::TurnStarted(notification) => {
-                self.clear_prompt_suggestion();
                 if from_replay {
                     self.restore_realtime_transcripts_before_turn(&notification.turn.id);
                 } else {
@@ -360,7 +373,6 @@ impl ChatWidget {
             | ServerNotification::McpServerEventStream(_)
             | ServerNotification::FileChangePatchUpdated(_)
             | ServerNotification::McpToolCallProgress(_)
-            | ServerNotification::McpServerOauthLoginCompleted(_)
             | ServerNotification::AppListUpdated(_)
             | ServerNotification::EnvironmentConnected(_)
             | ServerNotification::EnvironmentDisconnected(_)
@@ -408,10 +420,6 @@ impl ChatWidget {
         // User-message dedupe only suppresses the app-server echo of a prompt
         // this TUI already rendered locally. Once that turn ends, another
         // client can submit the same text and it still needs its own user cell.
-        let suggest = replay_kind.is_none()
-            && notification.turn.status == TurnStatus::Completed
-            && self.turn_lifecycle.agent_turn_running
-            && self.turn_lifecycle.last_turn_id.as_deref() == Some(notification.turn.id.as_str());
         self.last_rendered_user_message_display = None;
         let mut question_drafts = None;
         let was_replaying_turn_completion = self.thread_usage.replaying_turn_completion;
@@ -527,9 +535,6 @@ impl ChatWidget {
             self.finish_realtime_turn(&notification.turn.id);
         }
         self.thread_usage.replaying_turn_completion = was_replaying_turn_completion;
-        if suggest {
-            self.suggest_next_prompt(notification.turn.id);
-        }
     }
 
     fn handle_item_started_notification(

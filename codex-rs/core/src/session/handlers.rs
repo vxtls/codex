@@ -238,7 +238,7 @@ pub fn refresh_mcp_servers(sess: &Session) {
 }
 
 pub async fn reload_user_config(sess: &Arc<Session>) {
-    sess.reload_user_config_layer().await;
+    Box::pin(sess.reload_user_config_layer()).await;
 }
 
 pub async fn compact(sess: &Arc<Session>, sub_id: String) {
@@ -317,6 +317,8 @@ pub(super) async fn shutdown_session_runtime(sess: &Arc<Session>) {
         sess.mcp_refresh.close();
         sess.services.mcp_runtime.shutdown().await;
     }
+
+    sess.drain_code_mode_messages().await;
 
     crate::hook_runtime::run_session_end_hooks(sess).await;
     emit_thread_stop_lifecycle(sess).await;

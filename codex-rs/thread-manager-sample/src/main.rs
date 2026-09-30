@@ -27,7 +27,7 @@ use codex_core_api::ConfigRequirementsToml;
 use codex_core_api::Constrained;
 use codex_core_api::EnvironmentManager;
 use codex_core_api::EventMsg;
-use codex_core_api::ExecServerRuntimePaths;
+use codex_core_api::ExecServerRuntimeOptions;
 use codex_core_api::ExtensionRegistryBuilder;
 use codex_core_api::Feature;
 use codex_core_api::Features;
@@ -125,7 +125,7 @@ async fn run_main(arg0_paths: Arg0DispatchPaths) -> anyhow::Result<()> {
 
     let auth_manager =
         AuthManager::shared_from_config(&config, /*enable_codex_api_key_env*/ false).await?;
-    let local_runtime_paths = ExecServerRuntimePaths::from_optional_paths(
+    let local_runtime_paths = ExecServerRuntimeOptions::from_optional_paths(
         config.codex_self_exe.clone(),
         config.codex_linux_sandbox_exe.clone(),
     )?;
@@ -267,6 +267,9 @@ async fn new_config(
         guardian_policy_config: None,
         guardian_extra_policy: None,
         guardian_policy_template: None,
+        guardian_conversation_history_prompt: None,
+        guardian_conversation_history_max_output_tokens: None,
+        guardian_circuit_break_action: Default::default(),
         include_permissions_instructions: false,
         include_apps_instructions: false,
         include_collaboration_mode_instructions: false,
@@ -284,7 +287,6 @@ async fn new_config(
         show_tooltips: true,
         tui_show_server_version_notice: true,
         tui_auto_recap: true,
-        tui_prompt_suggestions: false,
         model_availability_nux: ModelAvailabilityNuxConfig::default(),
         tui_fullscreen_transcript: false,
         tui_copy_on_select: Default::default(),
@@ -378,6 +380,8 @@ async fn new_config(
         sleep_tool_mode: Default::default(),
         features: Default::default(),
         prefer_mxc: false,
+
+        runtime_feature_defaults: Default::default(),
         suppress_unstable_features_warning: false,
         active_project: ProjectConfig { trust_level: None },
         notices: Notice::default(),

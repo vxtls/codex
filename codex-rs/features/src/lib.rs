@@ -3,6 +3,7 @@
 //! This crate defines the feature registry plus the logic used to resolve an
 //! effective feature set from config-like inputs.
 
+use codex_protocol::openai_models::ReasoningEffort;
 use codex_protocol::protocol::Event;
 use codex_protocol::protocol::EventMsg;
 use codex_protocol::protocol::WarningEvent;
@@ -31,6 +32,7 @@ pub use feature_configs::NetworkProxyDomainPermissionToml;
 pub use feature_configs::NetworkProxyModeToml;
 pub use feature_configs::NetworkProxyUnixSocketPermissionToml;
 pub use feature_configs::NonPrefixedMcpToolNamesConfigToml;
+pub use feature_configs::RemoteMessageBoardConfigToml;
 use feature_configs::RemovedAppsMcpPathOverrideConfigToml;
 pub use feature_configs::RolloutBudgetConfigToml;
 pub use feature_configs::SleepToolConfigToml;
@@ -327,11 +329,16 @@ pub enum Feature {
     /// Removed compatibility flag for always-on thread-owned Guardian context.
     GuardianThreadContext,
     /// Reuse encrypted parent compaction when restarting Guardian review sessions.
+    /// When disabled, retain an independent review transcript across parent compaction.
     GuardianReuseParentCompaction,
+    /// Limit worker Guardian root evidence to preceding root communication windows.
+    GuardianRootHandoffContext,
     /// Include completed node_repl or cua_repl Code Mode responses in Guardian reviews.
     GuardianEnhancedNodeReplTranscripts,
     /// Include completed node_repl or cua_repl Code Mode response images in Guardian reviews.
     GuardianNodeReplTranscriptImages,
+    /// Give Guardian access to the root conversation's message history tools.
+    GuardianConversationHistoryTools,
     /// Enable Guardian V2 automatic approval reviews.
     GuardianV2,
     /// Removed compatibility flag for the unused Guardian extension prototype.
@@ -511,6 +518,11 @@ impl Features {
 
     pub fn enabled(&self, f: Feature) -> bool {
         self.enabled.contains(&f)
+    }
+
+    /// Returns whether persistent execution is enabled for the selected effort.
+    pub fn persistent_execution_enabled(&self, reasoning_effort: Option<&ReasoningEffort>) -> bool {
+        reasoning_effort == Some(&ReasoningEffort::Persistent)
     }
 
     pub fn apps_enabled_for_auth(&self, has_chatgpt_auth: bool) -> bool {
@@ -1653,6 +1665,12 @@ pub const FEATURES: &[FeatureSpec] = &[
         default_enabled: true,
     },
     FeatureSpec {
+        id: Feature::GuardianRootHandoffContext,
+        key: "guardian_root_handoff_context",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
         id: Feature::GuardianEnhancedNodeReplTranscripts,
         key: "guardian_enhanced_node_repl_transcripts",
         stage: Stage::UnderDevelopment,
@@ -1661,6 +1679,12 @@ pub const FEATURES: &[FeatureSpec] = &[
     FeatureSpec {
         id: Feature::GuardianNodeReplTranscriptImages,
         key: "guardian_node_repl_transcript_images",
+        stage: Stage::UnderDevelopment,
+        default_enabled: false,
+    },
+    FeatureSpec {
+        id: Feature::GuardianConversationHistoryTools,
+        key: "guardian_conversation_history_tools",
         stage: Stage::UnderDevelopment,
         default_enabled: false,
     },

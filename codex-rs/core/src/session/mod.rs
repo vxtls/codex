@@ -21,7 +21,6 @@ use crate::attestation::AttestationProvider;
 use crate::compact;
 use crate::compact::CompactedHistoryMetadata;
 use crate::config::ManagedFeatures;
-use crate::config::resolve_tool_suggest_config_from_layer_stack;
 use crate::context::ContextualUserFragment;
 use crate::context::DeveloperInstructions;
 use crate::context::GuardianPolicy;
@@ -31,6 +30,7 @@ use crate::context::MultiAgentRoleInstructions;
 use crate::context::NetworkRuleSaved;
 use crate::context::RecommendedPluginsInstructions;
 use crate::context::world_state::WorldState;
+use crate::context::world_state::WorldStateSnapshot;
 use crate::current_time::TimeProvider;
 use crate::environment_selection::TurnEnvironmentSnapshot;
 use crate::exec_policy::BANNED_PREFIX_SUGGESTIONS;
@@ -227,6 +227,7 @@ use codex_protocol::error::Result as CodexResult;
 use codex_protocol::exec_output::StreamOutput;
 
 mod code_mode_warning;
+mod config_refresh;
 pub(crate) mod context_window;
 mod daemon_recovery;
 mod environment;
@@ -658,6 +659,11 @@ impl Session {
                 config.http_client_factory(),
             )
             .await;
+        if model.trim().is_empty() {
+            return Err(CodexErr::InvalidRequest(
+                "No models are available. Set `model` explicitly or check your model catalog configuration.".to_string(),
+            ));
+        }
         let trusted_guardian_reviewer = crate::guardian::is_basic_session_source(&session_source)
             && !matches!(conversation_history, InitialHistory::Resumed(_));
         if config
@@ -2040,75 +2046,6 @@ impl Session {
         state.session_configuration.provider.info().clone()
     }
 
-    pub(crate) async fn refresh_runtime_config(&self, next_config: Config) {
-        self.refresh_runtime_config_inner(next_config, /*refresh_recording*/ true)
-            .await;
-    }
-
-    async fn refresh_runtime_config_inner(&self, next_config: Config, refresh_recording: bool) {
-        // Refresh only the user layer from the incoming snapshot. Preserve thread-local
-        // layers such as request/session overrides that were present when this session
-        // was created.
-        let notify_config_contributors = !self.services.extensions.config_contributors().is_empty();
-        let (previous_config, new_config, config) = {
-            let mut state = self.state.lock().await;
-            let previous_config = notify_config_contributors
-                .then(|| self.build_effective_session_config(&state.session_configuration));
-            let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-            config.active_project = next_config.active_project.clone();
-            config.config_layer_stack = config
-                .config_layer_stack
-                .with_user_layer_from(&next_config.config_layer_stack);
-            config.tool_suggest =
-                resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
-            config.mcp_servers = next_config.mcp_servers.clone();
-            config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
-            config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
-            // Recording can follow rollout changes without changing the session's
-            // execution features (including Code Mode's dispatch gate).
-            if refresh_recording {
-                self.services
-                    .executed_tool_calls
-                    .refresh(&next_config.features);
-            }
-            if let Err(err) = config.features.set_enabled(
-                Feature::Mcp20260728,
-                next_config.features.enabled(Feature::Mcp20260728),
-            ) {
-                warn!("failed to refresh MCP protocol config: {err}");
-            }
-            if let Err(err) = config.features.set_enabled(
-                Feature::CodexAppsMcp20260728,
-                next_config.features.enabled(Feature::CodexAppsMcp20260728),
-            ) {
-                warn!("failed to refresh Codex Apps MCP protocol config: {err}");
-            }
-            if let Err(err) = config.features.set_enabled(
-                Feature::SecretAuthStorage,
-                next_config.features.enabled(Feature::SecretAuthStorage),
-            ) {
-                warn!("failed to refresh MCP auth storage config: {err}");
-            }
-            if let Err(err) = config.features.set_enabled(
-                Feature::McpOAuthRefreshCoordination,
-                next_config
-                    .features
-                    .enabled(Feature::McpOAuthRefreshCoordination),
-            ) {
-                warn!("failed to refresh MCP OAuth coordination config: {err}");
-            }
-            let config = Arc::new(config);
-            state.session_configuration.original_config_do_not_use = Arc::clone(&config);
-            self.mark_mcp_runtime_dirty();
-            let new_config = notify_config_contributors
-                .then(|| self.build_effective_session_config(&state.session_configuration));
-            (previous_config, new_config, config)
-        };
-        self.emit_config_changed_contributors(previous_config.as_ref(), new_config.as_ref());
-        self.schedule_mcp_prewarm();
-        self.refresh_hooks(config).await;
-    }
-
     pub(crate) async fn refresh_hooks(&self, config: Arc<Config>) {
         let disabled_plugin_ids = self.state.lock().await.active_disabled_plugin_ids.clone();
         let environments = self.services.turn_environments.snapshot().await;
@@ -2131,48 +2068,6 @@ impl Session {
             let hooks = self.hooks().reconfigured(hooks_config);
             self.services.hooks.store(Arc::new(hooks));
         }
-    }
-
-    pub(crate) async fn refresh_mcp_config(&self, next_config: Config) {
-        let mut state = self.state.lock().await;
-        let mut config = (*state.session_configuration.original_config_do_not_use).clone();
-        config.config_layer_stack = next_config
-            .config_layer_stack
-            .with_user_layer_from(&config.config_layer_stack);
-        config.mcp_servers = next_config.mcp_servers;
-        config.mcp_optional_startup_grace = next_config.mcp_optional_startup_grace;
-        config.mcp_oauth_credentials_store_mode = next_config.mcp_oauth_credentials_store_mode;
-        if let Err(err) = config.features.set_enabled(
-            Feature::Mcp20260728,
-            next_config.features.enabled(Feature::Mcp20260728),
-        ) {
-            warn!("failed to refresh MCP protocol config: {err}");
-        }
-        if let Err(err) = config.features.set_enabled(
-            Feature::CodexAppsMcp20260728,
-            next_config.features.enabled(Feature::CodexAppsMcp20260728),
-        ) {
-            warn!("failed to refresh Codex Apps MCP protocol config: {err}");
-        }
-        if let Err(err) = config.features.set_enabled(
-            Feature::SecretAuthStorage,
-            next_config.features.enabled(Feature::SecretAuthStorage),
-        ) {
-            warn!("failed to refresh MCP auth storage config: {err}");
-        }
-        if let Err(err) = config.features.set_enabled(
-            Feature::McpOAuthRefreshCoordination,
-            next_config
-                .features
-                .enabled(Feature::McpOAuthRefreshCoordination),
-        ) {
-            warn!("failed to refresh MCP OAuth coordination config: {err}");
-        }
-        state.session_configuration.original_config_do_not_use = Arc::new(config);
-        self.services.mcp_runtime.invalidate_resource_caches();
-        self.mark_mcp_runtime_dirty();
-        drop(state);
-        self.schedule_mcp_prewarm();
     }
 
     fn emit_config_changed_contributors(
@@ -2198,60 +2093,75 @@ impl Session {
 
     pub(crate) async fn reload_user_config_layer(&self) {
         // Refresh layer-backed runtime state for an existing session, including enabled plugin,
-        // skill, and hook state. Derived config fields such as feature gates and legacy notify
-        // settings remain session-static.
+        // skill, hook, and MCP feature state. Other feature gates and legacy notify settings
+        // remain session-static.
         //
         // Prefer `refresh_runtime_config()` when the host can already provide a materialized
         // config snapshot. This file-based path exists for legacy local reload flows.
-        let config_toml_paths = {
-            let state = self.state.lock().await;
-            let config = &state.session_configuration.original_config_do_not_use;
-            let user_config_paths = config
-                .config_layer_stack
-                .all_layers_low_to_high()
-                .filter_map(|layer| match &layer.name {
-                    ConfigLayerSource::User { file, .. } => Some(file.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>();
-            if user_config_paths.is_empty() {
-                vec![
-                    state
-                        .session_configuration
-                        .codex_home
-                        .join(CONFIG_TOML_FILE),
-                ]
-            } else {
-                user_config_paths
-            }
-        };
+        // Retry from the current owner if another publication wins while files are read.
+        loop {
+            let (expected_config, config_toml_paths) = {
+                let state = self.state.lock().await;
+                let config = Arc::clone(&state.session_configuration.original_config_do_not_use);
+                let user_config_paths = config
+                    .config_layer_stack
+                    .all_layers_low_to_high()
+                    .filter_map(|layer| match &layer.name {
+                        ConfigLayerSource::User { file, .. } => Some(file.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let paths = if user_config_paths.is_empty() {
+                    vec![
+                        state
+                            .session_configuration
+                            .codex_home
+                            .join(CONFIG_TOML_FILE),
+                    ]
+                } else {
+                    user_config_paths
+                };
+                (config, paths)
+            };
 
-        let mut reloaded_user_configs = Vec::with_capacity(config_toml_paths.len());
-        for config_toml_path in config_toml_paths {
-            let user_config = match std::fs::read_to_string(&config_toml_path) {
-                Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
-                    Ok(config) => config,
+            let mut reloaded_user_configs = Vec::with_capacity(config_toml_paths.len());
+            for config_toml_path in config_toml_paths {
+                let user_config = match std::fs::read_to_string(&config_toml_path) {
+                    Ok(contents) => match toml::from_str::<toml::Value>(&contents) {
+                        Ok(config) => config,
+                        Err(err) => {
+                            warn!("failed to parse user config while reloading layer: {err}");
+                            return;
+                        }
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        toml::Value::Table(Default::default())
+                    }
                     Err(err) => {
-                        warn!("failed to parse user config while reloading layer: {err}");
+                        warn!("failed to read user config while reloading layer: {err}");
                         return;
                     }
-                },
-                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                    toml::Value::Table(Default::default())
-                }
-                Err(err) => {
-                    warn!("failed to read user config while reloading layer: {err}");
+                };
+                let Some(config_dir) = config_toml_path.parent() else {
+                    warn!("user config path has no parent directory");
                     return;
-                }
-            };
-            reloaded_user_configs.push((config_toml_path, user_config));
-        }
+                };
+                let user_config = match codex_config::loader::resolve_relative_paths_in_config_toml(
+                    user_config,
+                    &config_dir,
+                ) {
+                    Ok(config) => config,
+                    Err(err) => {
+                        warn!("failed to resolve paths while reloading user config: {err}");
+                        return;
+                    }
+                };
+                reloaded_user_configs.push((config_toml_path, user_config));
+            }
 
-        let next_config = {
-            let state = self.state.lock().await;
-            let mut config = (*state.session_configuration.original_config_do_not_use).clone();
+            let mut next_config = expected_config.as_ref().clone();
             for (config_toml_path, user_config) in reloaded_user_configs {
-                let config_layer_stack = match config
+                let config_layer_stack = match next_config
                     .config_layer_stack
                     .with_user_config(&config_toml_path, user_config)
                 {
@@ -2261,18 +2171,22 @@ impl Session {
                         return;
                     }
                 };
-                config.config_layer_stack = config_layer_stack;
+                next_config.config_layer_stack = config_layer_stack;
             }
-            config.tool_suggest =
-                resolve_tool_suggest_config_from_layer_stack(&config.config_layer_stack);
-            config
-        };
-        self.services.skills_service.clear_cache();
-        self.services.plugins_manager.clear_cache();
-        // This legacy snapshot still has the original execution features, not
-        // the host's latest rollout settings. Leave the live recorder alone.
-        self.refresh_runtime_config_inner(next_config, /*refresh_recording*/ false)
-            .await;
+            match self
+                .refresh_config(
+                    expected_config,
+                    next_config,
+                    crate::config::RuntimeConfigRefresh::UserFiles,
+                )
+                .await
+            {
+                crate::ConfigRefreshOutcome::Stale => continue,
+                crate::ConfigRefreshOutcome::Published | crate::ConfigRefreshOutcome::Rejected => {
+                    return;
+                }
+            }
+        }
     }
 
     /// Record a terminal CodexErr before the app-server completion notification is reduced.
@@ -2405,6 +2319,7 @@ impl Session {
             return;
         };
 
+        let mut error_info = None;
         let status = match turn_context.terminal_error.lock().await.take() {
             Some(error) => {
                 let status = AgentStatus::Errored(error.message);
@@ -2412,10 +2327,21 @@ impl Session {
                 status
             }
             None => {
-                let Some(status) = agent_status_from_event(msg) else {
-                    return;
-                };
-                status
+                if let EventMsg::TurnAborted(event) = msg
+                    && event.reason == TurnAbortReason::Interrupted
+                    && let Some(error) = &event.error
+                    && error.codex_error_info == Some(CodexErrorInfo::TooManyDenials)
+                {
+                    // Report the safety stop to the parent without changing the child's
+                    // interrupted status or notifying for ordinary interruptions.
+                    error_info = error.codex_error_info.clone();
+                    AgentStatus::Errored(error.message.clone())
+                } else {
+                    let Some(status) = agent_status_from_event(msg) else {
+                        return;
+                    };
+                    status
+                }
             }
         };
         if !is_final(&status) {
@@ -2435,6 +2361,7 @@ impl Session {
                         .initiating_agent_path()
                         .cloned(),
                     status,
+                    error_info,
                 },
                 &self.services.rollout_thread_trace,
             )
@@ -3689,8 +3616,12 @@ impl Session {
         let world_state_item = world_state_snapshot
             .merge_patch_from(&previous_snapshot)
             .map(WorldStateItem::patch);
+        // A catalog may have left history during compaction even when its snapshot survives.
         let items = crate::context_manager::updates::merge_contextual_fragments(
-            world_state.render_diff(&previous_snapshot),
+            world_state.render_history_diff(
+                Some(&previous_snapshot),
+                self.state.lock().await.history.raw_items(),
+            ),
         );
         if !items.is_empty() {
             self.record_conversation_items(turn_context, &step_context.settings.model_info, &items)
@@ -3976,19 +3907,47 @@ impl Session {
             )
             .await;
         let items = items.as_ref();
-        let response_item = items[0].clone();
+        let mut response_item = ResponseItemEnvelope::new(items[0].clone());
+        // A send confirmed after the pending snapshot must not reach the rollout
+        // before this boundary; older readers assign deliveries by physical order.
+        let boundary = self
+            .code_mode_message_tasks
+            .communication_boundary
+            .acquire()
+            .await
+            .unwrap_or_else(|_| unreachable!("communication boundary remains open"));
+        // Older readers assign delivered assistant messages to the next physical
+        // communication boundary, so persist earlier confirmed sends first.
+        let (order, pending) = {
+            let mut state = self.state.lock().await;
+            (
+                state.history.reserve_input_order(),
+                self.pending_code_mode_message_recordings(),
+            )
+        };
+        response_item
+            .metadata
+            .get_or_insert_default()
+            .user_input_order = Some(order);
+        for mut recording in pending {
+            let _ = recording.changed().await;
+        }
         {
             let mut state = self.state.lock().await;
             state.current_time_reminder.note_recorded_items(items);
-            state.record_items(items.iter(), model_info.truncation_policy.into());
+            state.history.record_annotated_items(
+                std::slice::from_mut(&mut response_item),
+                model_info.truncation_policy.into(),
+            );
         }
         self.persist_rollout_items(&[
             RolloutItem::InterAgentCommunicationMetadata {
                 trigger_turn: communication.trigger_turn,
             },
-            RolloutItem::ResponseItem(response_item.into()),
+            RolloutItem::ResponseItem(response_item),
         ])
         .await;
+        drop(boundary);
         self.send_raw_response_items(turn_context, items).await;
     }
 
@@ -4098,10 +4057,23 @@ impl Session {
         // Wait for accepted updates to finish persisting, then keep later updates from
         // overtaking the current settings snapshot while its checkpoint is written.
         let _settings_guard = thread_settings::acquire_persistence_lock(self).await;
-        // Compaction starts a new history window, so its WorldState baseline must be full.
+        // A new history window needs a full checkpoint, even when it contains only
+        // extension metadata and model-visible context will be rebuilt on the next turn.
         let mut world_state_item = None;
         let compacted_item = {
             let mut state = self.state.lock().await;
+            let snapshot = world_state_baseline
+                .map(|world_state| world_state.snapshot())
+                .or_else(|| {
+                    let previous = state.history.world_state_checkpoint()?;
+                    let mut retained = serde_json::Map::new();
+                    for contributor in self.services.extensions.context_contributors() {
+                        retained.extend(
+                            contributor.retain_world_state_after_compaction(&previous.state),
+                        );
+                    }
+                    (!retained.is_empty()).then(|| WorldStateSnapshot::from(&retained))
+                });
             state.replace_annotated_history(
                 items,
                 reference_context_item.clone(),
@@ -4110,8 +4082,7 @@ impl Session {
                 },
             );
             state.reasoning_effort_pin = ReasoningEffortPin::Compacted;
-            if let Some(world_state) = world_state_baseline {
-                let snapshot = world_state.snapshot();
+            if let Some(snapshot) = snapshot {
                 world_state_item = Some(WorldStateItem::full(snapshot.clone().into_object()));
                 state.history.set_world_state_baseline(snapshot);
             }

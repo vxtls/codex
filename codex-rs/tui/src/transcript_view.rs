@@ -19,6 +19,7 @@ mod search;
 mod selection;
 mod snapshot;
 mod text;
+mod turn_tip;
 
 use std::sync::Arc;
 
@@ -85,10 +86,12 @@ struct VisibleRow {
 /// Shared scrolling and interaction state for compact and detailed transcript presentations.
 pub(crate) struct TranscriptView {
     pub(crate) copy_on_select: bool,
+    pub(crate) primary_selection: bool,
     position: Position,
     follow_control: follow_control::FollowControl,
     copy_feedback: Option<composer_gap::CopyFeedback>,
     composer_tip: Option<(Rect, HyperlinkLine)>,
+    turn_tip_key: Option<EntryKey>,
     cache: LayoutCache,
     live: Option<Arc<TextLayout>>,
     live_separated: Option<Arc<TextLayout>>,
@@ -116,10 +119,12 @@ impl Default for TranscriptView {
     fn default() -> Self {
         Self {
             copy_on_select: false,
+            primary_selection: false,
             position: Position::Latest,
             follow_control: follow_control::FollowControl::default(),
             copy_feedback: None,
             composer_tip: None,
+            turn_tip_key: None,
             cache: LayoutCache::default(),
             live: None,
             live_separated: None,
@@ -146,6 +151,19 @@ impl Default for TranscriptView {
 }
 
 impl TranscriptView {
+    /// Rows left after the last render, including all startup notices and live entries.
+    /// Callers can paint temporary UI here without changing selection or saved history.
+    pub(crate) fn remaining_area(&self) -> Rect {
+        let used = u16::try_from(self.visible.len())
+            .unwrap_or(u16::MAX)
+            .min(self.area.height);
+        Rect {
+            y: self.area.y + used,
+            height: self.area.height - used,
+            ..self.area
+        }
+    }
+
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer, cells: &[Arc<dyn HistoryCell>]) {
         self.composer_tip = None;
         self.cache.begin_frame();
@@ -271,8 +289,12 @@ impl TranscriptView {
         expanded: bool,
         lines: impl FnOnce(u16) -> Option<ActivityTranscriptLines>,
     ) -> bool {
+        let shortcut = self
+            .disclosure
+            .keymap
+            .primary_hint(crate::keymap::KeymapContext::Global, "open_transcript");
         self.sync_live_layout(width, key, |width| {
-            lines(width).map(|lines| layout::activity_layout(lines, width, expanded))
+            lines(width).map(|lines| layout::activity_layout(lines, width, expanded, shortcut))
         })
     }
 
@@ -539,6 +561,15 @@ impl TranscriptView {
                 row = self
                     .layout(cells, index)
                     .map_or(/*default*/ 0, |l| l.row_count());
+            }
+            // At the beginning, hidden entries are not preceding content. Keep the first
+            // visible entry at the same position whether it is live or committed.
+            if index == 0
+                && remaining >= row
+                && let Some(first) = self.next_nonempty(cells, index)
+                && let Some(layout) = self.layout(cells, first)
+            {
+                return (first, usize::from(layout.separated));
             }
             return (index, row.saturating_sub(remaining));
         }

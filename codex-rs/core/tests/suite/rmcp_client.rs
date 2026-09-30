@@ -696,20 +696,30 @@ async fn text_only_mcp_content_uses_content_items() -> anyhow::Result<()> {
         ])
     );
 
-    let first_turn_id = request.body_json()["client_metadata"]["turn_id"].clone();
+    let request_body = request.body_json();
+    let first_turn_id = request_body["client_metadata"]["turn_id"].clone();
     assert!(first_turn_id.is_string());
+    let expected_attribution = json!({
+        "status": "complete",
+        "sources": [{
+            "server_name": "rmcp",
+            "tool_name": "image_scenario",
+            "first_turn_id": first_turn_id,
+        }],
+    });
     assert_eq!(
         serde_json::to_value(codex_core::test_support::mcp_attribution_snapshot(
             &fixture.codex
         ))?,
-        json!({
-            "status": "complete",
-            "sources": [{
-                "server_name": "rmcp",
-                "tool_name": "image_scenario",
-                "first_turn_id": first_turn_id,
-            }],
-        })
+        expected_attribution,
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            request_body["client_metadata"]["mcp_attribution"]
+                .as_str()
+                .context("MCP attribution should be included for the OpenAI provider")?,
+        )?,
+        expected_attribution,
     );
 
     server.verify().await;
@@ -4376,6 +4386,7 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         Some("OAuth sign-in is still pending."),
     );
 
+    let current_config = fixture.codex.config().await;
     let mut refreshed_config = fixture.config.clone();
     let mut refreshed_servers = refreshed_config.mcp_servers.get().clone();
     let discovered_server = refreshed_servers
@@ -4388,9 +4399,9 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         .set(refreshed_servers)
         .expect("test MCP servers should accept the discovered OAuth server");
     let discovered_turn = tokio::time::timeout(Duration::from_secs(5), async {
-        fixture
+        let _ = fixture
             .codex
-            .refresh_runtime_config(refreshed_config.clone())
+            .refresh_runtime_config(current_config, refreshed_config.clone())
             .await;
         fixture
             .codex
@@ -4434,7 +4445,11 @@ async fn streamable_http_with_oauth_round_trip_impl() -> anyhow::Result<()> {
         )
         .await?
     );
-    fixture.codex.refresh_runtime_config(refreshed_config).await;
+    let current_config = fixture.codex.config().await;
+    let _ = fixture
+        .codex
+        .refresh_runtime_config(current_config, refreshed_config)
+        .await;
     let logged_out_startup = tokio::time::timeout(
         Duration::from_secs(5),
         wait_for_event(&fixture.codex, |event| {

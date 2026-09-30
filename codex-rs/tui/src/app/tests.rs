@@ -1,5 +1,8 @@
 //! App-level orchestration tests for the TUI.
 
+#[path = "tests/mcp_login_tests.rs"]
+mod mcp_login_tests;
+
 #[path = "tests/daybreak_tests.rs"]
 mod daybreak_tests;
 #[path = "tests/math_interruption_tests.rs"]
@@ -56,6 +59,8 @@ mod pagination_completion_tests;
 mod patch_approval_tests;
 #[path = "tests/permission_selection_tests.rs"]
 mod permission_selection_tests;
+#[path = "tests/projectless_tests.rs"]
+mod projectless_tests;
 #[path = "tests/unavailable_commands_tests.rs"]
 mod unavailable_commands;
 
@@ -80,7 +85,6 @@ mod resume_shutdown_tests;
 mod safety_buffering;
 #[path = "tests/session_lifecycle_requests.rs"]
 mod session_lifecycle_requests;
-mod session_summary;
 mod startup;
 #[path = "tests/startup_frame_tests.rs"]
 mod startup_frame_tests;
@@ -630,7 +634,6 @@ async fn enqueue_primary_thread_session_replays_buffered_approval_after_attach()
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
-            reasoning_summary: None,
         },
         session_lifecycle::ThreadAttachPresentation::SessionLineage,
         /*initial_user_message*/ None,
@@ -1434,6 +1437,15 @@ async fn replay_only_thread_keeps_restored_queue_visible() {
     let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
     let thread_id = ThreadId::new();
     let session = test_thread_session(thread_id, test_path_buf("/tmp/project"));
+    app.thread_event_channels.insert(
+        thread_id,
+        ThreadEventChannel::new_with_session(
+            THREAD_EVENT_CHANNEL_CAPACITY,
+            session.clone(),
+            Vec::new(),
+        ),
+    );
+    app.activate_thread_channel(thread_id).await;
     app.chat_widget.handle_thread_session(session.clone());
     app.chat_widget.handle_server_notification(
         turn_started_notification(thread_id, "turn-1"),
@@ -1447,10 +1459,11 @@ async fn replay_only_thread_keeps_restored_queue_visible() {
         .apply_external_edit("queued follow-up".to_string());
     app.chat_widget
         .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    let input_state = app
+    let mut input_state = app
         .chat_widget
         .capture_thread_input_state()
         .expect("expected queued follow-up state");
+    input_state.reconnect_pending = true;
 
     let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
         make_chatwidget_manual_with_sender().await;
@@ -1623,13 +1636,24 @@ async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up()
         /*replay_kind*/ None,
     );
     app.chat_widget
+        .apply_external_edit("accepted steer".to_string());
+    app.chat_widget
+        .handle_key_event(KeyEvent::from(KeyCode::Enter));
+    app.chat_widget
         .apply_external_edit("queued follow-up".to_string());
     app.chat_widget
         .handle_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
-    let input_state = app
+    let mut input_state = app
         .chat_widget
         .capture_thread_input_state()
         .expect("expected queued follow-up state");
+    let client_id = input_state
+        .pending_steers
+        .front()
+        .unwrap()
+        .client_id
+        .clone();
+    input_state.reconnect_pending = true;
 
     let (chat_widget, _app_event_tx, _rx, mut new_op_rx) =
         make_chatwidget_manual_with_sender().await;
@@ -1643,6 +1667,21 @@ async fn replay_thread_snapshot_does_not_submit_queue_before_replay_catches_up()
             session: None,
             turns: Vec::new(),
             events: vec![
+                ThreadBufferedEvent::Notification(Box::new(ServerNotification::ItemCompleted(
+                    codex_app_server_protocol::ItemCompletedNotification {
+                        thread_id: thread_id.to_string(),
+                        turn_id: "turn-1".into(),
+                        completed_at_ms: 0,
+                        item: ThreadItem::UserMessage {
+                            id: "accepted".into(),
+                            client_id: Some(client_id),
+                            content: vec![UserInput::Text {
+                                text: "accepted steer".into(),
+                                text_elements: Vec::new(),
+                            }],
+                        },
+                    },
+                ))),
                 ThreadBufferedEvent::Notification(Box::new(turn_completed_notification(
                     thread_id,
                     "turn-0",
@@ -3049,7 +3088,7 @@ async fn server_only_profile_selection_keeps_turns_on_the_selected_profile() -> 
     let selection = PermissionProfileSelection {
         profile_id: "server-only".into(),
         approval_policy: None,
-        approvals_reviewer: None,
+        approvals_reviewer: Some(ApprovalsReviewer::User),
         display_label: "server-only".into(),
     };
     app.select_permission_profile(&mut server, selection.clone())
@@ -3062,6 +3101,9 @@ async fn server_only_profile_selection_keeps_turns_on_the_selected_profile() -> 
     let thread_id = started.session.thread_id;
     app.enqueue_primary_thread_session(started.session, started.turns)
         .await?;
+    app.runtime_approvals_reviewer_override = Some(ApprovalsReviewer::AutoReview);
+    app.runtime_permission_profile_override =
+        Some(RuntimePermissionProfileOverride::from_config(&app.config));
     while events.try_recv().is_ok() {}
     app.select_permission_profile(&mut server, selection.clone())
         .await;
@@ -3070,7 +3112,8 @@ async fn server_only_profile_selection_keeps_turns_on_the_selected_profile() -> 
         @"• Permission selection requested: server-only"
     );
     let mut tui = crate::tui::test_support::make_test_tui()?;
-    app.select_permission_profile(&mut server, selection).await;
+    app.select_permission_profile(&mut server, selection.clone())
+        .await;
     insta::assert_snapshot!(
         next_history_message(&mut events),
         @"■ Wait for permissions to update before changing permissions."
@@ -3100,6 +3143,32 @@ async fn server_only_profile_selection_keeps_turns_on_the_selected_profile() -> 
     )
     .await?;
     assert!(!app.pending_server_profiles.contains_key(&thread_id));
+    assert_eq!(
+        (
+            app.runtime_approvals_reviewer_override,
+            app.chat_widget.config_ref().approvals_reviewer
+        ),
+        (None, ApprovalsReviewer::User),
+    );
+    app.runtime_approvals_reviewer_override = Some(ApprovalsReviewer::User);
+    app.select_permission_profile(
+        &mut server,
+        PermissionProfileSelection {
+            approvals_reviewer: None,
+            ..selection.clone()
+        },
+    )
+    .await;
+    let settings = next_thread_settings_updated(&mut server, thread_id).await;
+    app.enqueue_thread_notification(
+        thread_id,
+        ServerNotification::ThreadSettingsUpdated(settings),
+    )
+    .await?;
+    assert_eq!(
+        app.runtime_approvals_reviewer_override,
+        Some(ApprovalsReviewer::User),
+    );
     let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:8765")?;
     app.app_server_target = crate::AppServerTarget::Remote { endpoint };
     while events.try_recv().is_ok() {}
@@ -3156,33 +3225,6 @@ async fn server_only_profile_selection_keeps_turns_on_the_selected_profile() -> 
 }
 
 #[tokio::test]
-async fn resume_rejects_selected_config_profile_permission_definitions() -> Result<()> {
-    let home = tempdir()?;
-    std::fs::write(
-        home.path().join("config.toml"),
-        "default_permissions = \":workspace\"\n",
-    )?;
-    let selected = home.path().join("work.config.toml");
-    std::fs::write(
-        &selected,
-        "default_permissions = \":workspace\"\n[permissions.unused]\nextends = \":read-only\"\n",
-    )?;
-    let mut loader = codex_config::LoaderOverrides::without_managed_config_for_tests();
-    loader.user_config_path = Some(selected.abs());
-    loader.user_config_profile = Some("work".parse()?);
-    let config = ConfigBuilder::default()
-        .codex_home(home.path().to_path_buf())
-        .loader_overrides(loader)
-        .build()
-        .await?;
-    assert!(config_persistence::has_explicit_resume_permission_override(
-        &config,
-        &ConfigOverrides::default()
-    ));
-    Ok(())
-}
-
-#[tokio::test]
 async fn remote_resume_rejects_explicit_permission_override() -> Result<()> {
     let (mut app, mut events, _ops) = make_test_app_with_channels().await;
     let endpoint = crate::resolve_remote_addr("ws://127.0.0.1:8765")?;
@@ -3194,13 +3236,8 @@ async fn remote_resume_rejects_explicit_permission_override() -> Result<()> {
     )?;
     app.config.codex_home = home.path().to_path_buf().abs();
     let mut server = crate::start_embedded_app_server_for_picker(&app.config).await?;
-    let selected = home.path().join("work.config.toml");
-    std::fs::write(
-        &selected,
-        "[permissions.unused]\nextends = \":read-only\"\n",
-    )?;
-    app.loader_overrides.user_config_path = Some(selected.abs());
-    app.loader_overrides.user_config_profile = Some("work".parse()?);
+    app.cli_kv_overrides
+        .push(("default_permissions".into(), ":workspace".into()));
     assert!(
         !config_persistence::has_explicit_resume_permission_override(
             &app.config,
@@ -3260,6 +3297,7 @@ default_permissions = "locked-down"
     app.harness_overrides.sandbox_mode = Some(SandboxMode::WorkspaceWrite);
     app.harness_overrides.permission_profile = Some(PermissionProfile::workspace_write());
 
+    app.set_approvals_reviewer_in_app_and_widget(ApprovalsReviewer::AutoReview);
     assert!(
         app.apply_permission_profile_selection(PermissionProfileSelection {
             profile_id: "locked-down".to_string(),
@@ -3290,6 +3328,14 @@ default_permissions = "locked-down"
     assert_eq!(
         app.runtime_permission_profile_override,
         Some(RuntimePermissionProfileOverride::from_config(&app.config))
+    );
+    let mut destination = app.config.clone();
+    destination.approvals_reviewer = ApprovalsReviewer::User;
+    app.apply_runtime_policy_overrides(&mut destination, RuntimePolicyOverrideScope::ExplicitOnly)?;
+    assert_eq!(destination.approvals_reviewer, ApprovalsReviewer::User);
+    assert!(
+        !app.resume_permission_overrides(&destination)
+            .approvals_reviewer
     );
     let op = match app_event_rx.try_recv() {
         Ok(AppEvent::CodexOp(op)) => op,
@@ -4731,13 +4777,7 @@ async fn thread_read_session_state_does_not_reuse_primary_permission_profile() {
     app.enqueue_primary_thread_session(session, Vec::new())
         .await
         .expect("switch to read thread");
-    let header =
-        lines_to_single_string(&app.clear_ui_header_lines_with_version(/*width*/ 80, "<VERSION>"));
-    let model_line = header
-        .lines()
-        .find(|line| line.contains("model:"))
-        .expect("rendered model line");
-    assert_app_snapshot!("thread_read_model_after_switch", model_line);
+    assert_eq!(app.chat_widget.current_model(), "server-reported-model");
 }
 
 #[test]
@@ -5313,7 +5353,6 @@ async fn primary_thread_ignores_child_mcp_startup_notifications() {
             turns: Vec::new(),
             blocks_direct_input: false,
             task_tools_available: false,
-            reasoning_summary: None,
         },
         &mut child_snapshot,
     )
@@ -5828,7 +5867,6 @@ async fn render_clear_ui_header_after_long_transcript_for_snapshot() -> String {
             is_first,
             /*tooltip_override*/ None,
             /*auth_plan*/ None,
-            /*show_fast_status*/ false,
         )) as Arc<dyn HistoryCell>
     };
 
@@ -5936,7 +5974,9 @@ async fn ctrl_l_clears_owned_history_and_preserves_the_draft() -> Result<()> {
             .is::<history_cell::SessionHeaderHistoryCell>()
     );
     let header = lines_to_single_string(&app.transcript_cells[0].display_lines(/*width*/ 80));
-    assert!(header.contains("gpt-test"));
+    assert!(header.contains("OpenAI Codex"));
+    let raw_header = lines_to_single_string(&app.transcript_cells[0].raw_lines());
+    assert!(raw_header.contains("gpt-test"));
     assert!(!header.contains("old transcript row"));
     assert_eq!(
         app.chat_widget.composer_text_with_pending(),
@@ -5946,41 +5986,6 @@ async fn ctrl_l_clears_owned_history_and_preserves_the_draft() -> Result<()> {
     tui.set_owned_screen(/*owned*/ false)?;
     app_server.shutdown().await?;
     Ok(())
-}
-
-#[tokio::test]
-#[cfg_attr(
-    target_os = "windows",
-    ignore = "snapshot path rendering differs on Windows"
-)]
-async fn clear_ui_header_shows_fast_status_for_fast_capable_models() {
-    let mut app = make_test_app().await;
-    app.config.cwd = test_path_buf("/tmp/project").abs();
-    app.chat_widget.set_model("gpt-5.4");
-    set_fast_mode_test_catalog(&mut app.chat_widget);
-    app.chat_widget
-        .set_reasoning_effort(Some(ReasoningEffortConfig::XHigh));
-    app.chat_widget.set_service_tier(Some(
-        codex_protocol::config_types::ServiceTier::Fast
-            .request_value()
-            .to_string(),
-    ));
-    set_chatgpt_auth(&mut app.chat_widget);
-    set_fast_mode_test_catalog(&mut app.chat_widget);
-
-    let rendered = app
-        .clear_ui_header_lines_with_version(/*width*/ 80, "<VERSION>")
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-
-    assert_app_snapshot!("clear_ui_header_fast_status_fast_capable_models", rendered);
 }
 
 async fn make_test_app() -> Box<App> {
@@ -6008,10 +6013,12 @@ async fn make_test_app() -> Box<App> {
         loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
         cloud_config_bundle: CloudConfigBundleLoader::default(),
         runtime_approval_policy_override: None,
+        runtime_approvals_reviewer_override: None,
         runtime_permission_profile_override: None,
         file_search,
         transcript_cells: Vec::new(),
         native_history: Default::default(),
+        turn_tips: Default::default(),
         transcript_view: Default::default(),
         last_rendered_history_tail: None,
         last_thread_usage_status_cell: None,
@@ -6040,6 +6047,7 @@ async fn make_test_app() -> Box<App> {
         reconnect: Default::default(),
         pending_right_click_paste: None,
         right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+            primary: false,
             platform_default: true,
             ssh: false,
             wsl: false,
@@ -6056,7 +6064,6 @@ async fn make_test_app() -> Box<App> {
         background_voice: None,
         background_voice_error: None,
         temporary_structured_requests: HashMap::new(),
-        hidden_prompt_threads: VecDeque::new(),
         pending_thread_titles: HashMap::new(),
         thread_event_listener_tasks: HashMap::new(),
         agent_navigation: AgentNavigationState::default(),
@@ -6086,6 +6093,8 @@ async fn make_test_app() -> Box<App> {
         startup_pending_protected_request: false,
         rate_limit_hard_stop_generation: 0,
         rate_limit_refresh_state: Default::default(),
+        pending_mcp_login_start: None,
+        active_mcp_login_ids: HashMap::new(),
         pending_plugin_enabled_writes: HashMap::new(),
         pending_hook_enabled_writes: HashMap::new(),
         recap: recap::RecapState::default(),
@@ -6123,10 +6132,12 @@ pub(super) async fn make_test_app_with_channels() -> (
             loader_overrides: LoaderOverrides::without_managed_config_for_tests(),
             cloud_config_bundle: CloudConfigBundleLoader::default(),
             runtime_approval_policy_override: None,
+            runtime_approvals_reviewer_override: None,
             runtime_permission_profile_override: None,
             file_search,
             transcript_cells: Vec::new(),
             native_history: Default::default(),
+            turn_tips: Default::default(),
             transcript_view: Default::default(),
             last_rendered_history_tail: None,
             last_thread_usage_status_cell: None,
@@ -6155,6 +6166,7 @@ pub(super) async fn make_test_app_with_channels() -> (
             reconnect: Default::default(),
             pending_right_click_paste: None,
             right_click_paste_environment: super::right_click_paste::PasteEnvironment {
+                primary: false,
                 platform_default: true,
                 ssh: false,
                 wsl: false,
@@ -6171,7 +6183,6 @@ pub(super) async fn make_test_app_with_channels() -> (
             background_voice: None,
             background_voice_error: None,
             temporary_structured_requests: HashMap::new(),
-            hidden_prompt_threads: VecDeque::new(),
             pending_thread_titles: HashMap::new(),
             thread_event_listener_tasks: HashMap::new(),
             agent_navigation: AgentNavigationState::default(),
@@ -6201,6 +6212,8 @@ pub(super) async fn make_test_app_with_channels() -> (
             startup_pending_protected_request: false,
             rate_limit_hard_stop_generation: 0,
             rate_limit_refresh_state: Default::default(),
+            pending_mcp_login_start: None,
+            active_mcp_login_ids: HashMap::new(),
             pending_plugin_enabled_writes: HashMap::new(),
             pending_hook_enabled_writes: HashMap::new(),
             recap: recap::RecapState::default(),
@@ -6500,7 +6513,6 @@ async fn app_server_thread_replacement_clears_previous_transcript_before_replay(
             )],
             blocks_direct_input: false,
             task_tools_available: false,
-            reasoning_summary: None,
         },
         session_lifecycle::ThreadAttachPresentation::SessionLineage,
         /*initial_user_message*/ None,
@@ -6537,8 +6549,8 @@ async fn app_server_thread_replacement_clears_previous_transcript_before_replay(
         .iter()
         .map(|line| {
             let text = rendered_line_text(line);
-            if text.contains("│ directory: ") {
-                "│ directory: <thread cwd>                │".to_string()
+            if text.trim() == test_path_buf("/tmp/next").display().to_string() {
+                "     <thread cwd>".to_string()
             } else {
                 text
             }
@@ -7564,7 +7576,6 @@ async fn backtrack_selection_preserves_selected_prompt_and_requests_branch() {
             is_first,
             /*tooltip_override*/ None,
             /*auth_plan*/ None,
-            /*show_fast_status*/ false,
         )) as Arc<dyn HistoryCell>
     };
 
@@ -7750,7 +7761,7 @@ async fn remote_exec_resume_current_cwd_is_rejected() -> Result<()> {
     app.environment_manager = Arc::new(
         EnvironmentManager::create_for_tests(
             Some("ws://127.0.0.1:8765".to_string()),
-            Some(codex_exec_server::ExecServerRuntimePaths::new(
+            Some(codex_exec_server::ExecServerRuntimeOptions::new(
                 std::env::current_exe()?,
                 /*codex_linux_sandbox_exe*/ None,
             )?),
@@ -7997,7 +8008,7 @@ async fn in_app_resume_uses_configured_or_explicit_cwd() -> Result<()> {
             Arc::new(
                 EnvironmentManager::create_for_tests(
                     Some("ws://127.0.0.1:8765".to_string()),
-                    Some(codex_exec_server::ExecServerRuntimePaths::new(
+                    Some(codex_exec_server::ExecServerRuntimeOptions::new(
                         std::env::current_exe()?,
                         /*codex_linux_sandbox_exe*/ None,
                     )?),
@@ -8171,7 +8182,7 @@ async fn remembered_current_cwd_stays_at_launch_across_in_app_resumes() -> Resul
         Arc::new(EnvironmentManager::default_for_tests()),
     ))
     .await?;
-    let (mut app, _app_event_rx, _op_rx) = make_test_app_with_channels().await;
+    let (mut app, _app_event_rx, _op_rx) = Box::pin(make_test_app_with_channels()).await;
     app.config = config;
     app.launch_cwd = launch_cwd.clone();
     app.state_db = state_db;
@@ -8867,7 +8878,6 @@ async fn refreshed_snapshot_session_persists_resumed_turns() {
             turns: resumed_turns.clone(),
             blocks_direct_input: true,
             task_tools_available: false,
-            reasoning_summary: None,
         },
         &mut snapshot,
     )

@@ -22,6 +22,7 @@ use codex_app_server_protocol::GetAccountRateLimitsResponse;
 use codex_app_server_protocol::MarketplaceAddResponse;
 use codex_app_server_protocol::MarketplaceRemoveResponse;
 use codex_app_server_protocol::MarketplaceUpgradeResponse;
+use codex_app_server_protocol::McpServerOauthLoginResponse;
 use codex_app_server_protocol::McpServerStatus;
 use codex_app_server_protocol::McpServerStatusDetail;
 use codex_app_server_protocol::PluginInstallResponse;
@@ -61,7 +62,6 @@ use codex_app_server_protocol::AskForApproval;
 use codex_config::types::ApprovalsReviewer;
 use codex_features::Feature;
 use codex_plugin::PluginCapabilitySummary;
-use codex_protocol::config_types::CollaborationMode;
 use codex_protocol::config_types::CollaborationModeMask;
 use codex_protocol::models::ActivePermissionProfile;
 use codex_realtime_webrtc::StartedRealtimeWebrtcSession;
@@ -273,6 +273,7 @@ pub(crate) struct AgentsOverviewThreadRefresh {
     pub(crate) threads: std::collections::HashMap<ThreadId, Option<Thread>>,
     pub(crate) last_messages: std::collections::HashMap<ThreadId, String>,
     pub(crate) recent_seed_complete: bool,
+    pub(crate) discovery: Option<crate::app::agents_overview_discovery::AgentsOverviewDiscovery>,
 }
 
 #[allow(clippy::large_enum_variant)]
@@ -286,6 +287,7 @@ pub(crate) enum AppEvent {
     CloseMisalignmentReview,
     /// Open the live command center for recent and locally retained root sessions.
     OpenAgentsOverview,
+    ShowMoreAgentsOverview,
     /// Create an empty thread from the command center.
     NewAgentsOverviewSession {
         cwd: Option<AbsolutePathBuf>,
@@ -313,17 +315,6 @@ pub(crate) enum AppEvent {
     SuggestThreadName {
         thread_id: ThreadId,
         request_id: Uuid,
-    },
-    /// Generate a next-message suggestion for one live completed turn.
-    GeneratePromptSuggestion(crate::prompt_suggestions::SuggestionRequest),
-    PromptSuggestionStarted {
-        request: crate::prompt_suggestions::SuggestionRequest,
-        result: Result<(String, Option<CollaborationMode>), String>,
-    },
-    PromptSuggestionFinished {
-        request: crate::prompt_suggestions::SuggestionRequest,
-        temporary_thread_id: ThreadId,
-        text: Option<String>,
     },
     /// Register a hidden title-generation thread started in the background.
     ThreadTitleStarted {
@@ -1077,6 +1068,16 @@ pub(crate) enum AppEvent {
         thread_id: Option<ThreadId>,
     },
 
+    StartMcpLogin {
+        name: String,
+        thread_id: ThreadId,
+    },
+
+    McpLoginStarted {
+        request_id: String,
+        result: Result<McpServerOauthLoginResponse, String>,
+    },
+
     /// Result of fetching MCP inventory via app-server RPCs.
     McpInventoryLoaded {
         result: Result<Vec<McpServerStatus>, String>,
@@ -1106,6 +1107,11 @@ pub(crate) enum AppEvent {
     FollowTranscript,
 
     InsertHistoryCell(Box<dyn HistoryCell>),
+    /// FIFO barrier after the completed turn's history insertions.
+    TurnTipReady {
+        thread_id: ThreadId,
+        turn_id: String,
+    },
 
     /// Move visible completed voice captions into history in one app event.
     CommitRealtimeTranscriptHistory,

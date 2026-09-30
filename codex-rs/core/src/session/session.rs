@@ -1,5 +1,6 @@
 use super::input_queue::InputQueue;
 use super::mcp_refresh::McpRefresh;
+use super::retained_context::CodeModeMessageTasks;
 use super::step_context::StepContext;
 use super::step_settings::ModelInfoOverrides;
 use super::step_settings::StepSettings;
@@ -21,6 +22,7 @@ use crate::shell_snapshot::ShellSnapshot;
 use crate::shell_snapshot::SnapshotCredentialBrokerState;
 use crate::state::ActiveTurn;
 use crate::turn_metadata::ExecutionMetadata;
+use codex_analytics::ThreadProductUpdate;
 use codex_attachment_store::AttachmentStore;
 use codex_extension_api::ExtensionDataInit;
 use codex_http_client::ClientRouteClass;
@@ -64,6 +66,7 @@ pub(crate) struct Session {
     /// Orders accepted settings commits and their persisted events with compaction checkpoints.
     /// Keep this separate from `state` so storage I/O does not block runtime state access.
     pub(super) thread_settings_persistence: Semaphore,
+    pub(super) code_mode_message_tasks: CodeModeMessageTasks,
     /// Serializes rebuild/apply cycles for the running proxy; each cycle
     /// rebuilds from the current SessionState while holding this lock.
     pub(super) managed_network_proxy_refresh_lock: Semaphore,
@@ -1425,6 +1428,7 @@ impl Session {
             } else {
                 ShellSnapshot::disabled()
             };
+            let inherited_environments = inherited_environments.unwrap_or_default();
             let turn_environments = Arc::new(ThreadEnvironments::new(
                 environment_manager,
                 default_shell.clone(),
@@ -1433,7 +1437,7 @@ impl Session {
                     session_configuration.windows_sandbox_type,
                 ),
                 shell_snapshot,
-                inherited_environments.unwrap_or_default(),
+                inherited_environments.clone(),
                 config.features.enabled(Feature::DeferredExecutor),
             ));
             turn_environments.update_selections(environment_selections);
@@ -1490,6 +1494,7 @@ impl Session {
                 initial_auto_compact_window_ids,
                 ContextManager::for_session(
                     &session_configuration.session_source,
+                    &config.features,
                 ),
             );
             state.base_instructions_provenance = base_instructions_provenance.clone();
@@ -1595,6 +1600,9 @@ impl Session {
             }
 
             let analytics_events_client = if config.analytics_enabled == Some(false) {
+                if let Some(client) = &analytics_events_client {
+                    client.update_thread_product_sku(thread_id, ThreadProductUpdate::Clear);
+                }
                 AnalyticsEventsClient::disabled()
             } else {
                 analytics_events_client.unwrap_or_else(|| {
@@ -1605,6 +1613,13 @@ impl Session {
                     )
                 })
             };
+            analytics_events_client.update_thread_product_sku(
+                thread_id,
+                match &config.apps_mcp_product_sku {
+                    Some(product) => ThreadProductUpdate::Set(product.clone()),
+                    None => ThreadProductUpdate::Clear,
+                },
+            );
             for item in initial_history.get_rollout_items() {
                 match item {
                     RolloutItem::Compacted(compacted) => {
@@ -1767,6 +1782,7 @@ impl Session {
                 agent_status,
                 state: Mutex::new(state),
                 thread_settings_persistence: Semaphore::new(/*permits*/ 1),
+                code_mode_message_tasks: CodeModeMessageTasks::default(),
                 managed_network_proxy_refresh_lock: Semaphore::new(/*permits*/ 1),
                 features: config.features.clone(),
                 isolation,
@@ -1880,7 +1896,12 @@ impl Session {
             )
             .await?;
             sess.start_mcp_prewarm_worker(mcp_prewarm_rx, mcp_auth_changes);
-            sess.schedule_startup_prewarm().await;
+            sess.follow_inherited_environment_configurations(
+                &inherited_environments,
+                &session_configuration.environments,
+            );
+            sess.schedule_startup_prewarm(super::startup_prewarm::PrewarmInput::Base)
+                .await;
             let session_start_source = match &initial_history {
                 InitialHistory::Forked(_) if forked_from_id.is_some() => {
                     codex_hooks::SessionStartSource::Fork
